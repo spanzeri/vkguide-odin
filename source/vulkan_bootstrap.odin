@@ -218,6 +218,7 @@ Physical_Device :: struct {
     transfer_queue_family_index:    u32,
     present_queue_family_index:     u32,
     device_type:                    vk.PhysicalDeviceType,
+    required_features:              vk.PhysicalDeviceFeatures2,
 }
 
 vkbootstrap_init_physical_device_config :: proc(
@@ -360,8 +361,8 @@ vkbootstrap_select_physical_device :: proc(
         }
 
         // Check if the physical device supports the required features
-        req_features := config.required_features
-        if !_check_physical_device_features(curr_pd, &req_features) {
+        physical_device.required_features = config.required_features
+        if !_check_physical_device_features(curr_pd, &physical_device.required_features) {
             log.infof(
                 "Physical device '%s' does not support the required features. Skipping.",
                 cstring(&props.deviceName[0]),
@@ -397,6 +398,7 @@ vkbootstrap_select_physical_device :: proc(
                 transfer_queue_family_index = transfer_qfi,
                 present_queue_family_index  = present_qfi,
                 device_type                 = props.deviceType,
+                required_features           = config.required_features,
             }
         }
     }
@@ -553,16 +555,12 @@ _find_queue_family_indices :: proc(
 Device_Config :: struct {
     physical_device:        Physical_Device,
     required_extensions:    []cstring,
-    required_features:      vk.PhysicalDeviceFeatures2,
 }
 
 vkbootstrap_init_device_config :: proc(physical_device: Physical_Device) -> Device_Config {
     return Device_Config{
         physical_device = physical_device,
         required_extensions = []cstring{},
-        required_features = vk.PhysicalDeviceFeatures2{
-            sType = .PHYSICAL_DEVICE_FEATURES_2,
-        },
     }
 }
 
@@ -646,8 +644,8 @@ vkbootstrap_create_device :: proc(config: Device_Config) -> (device: Device, ok:
     }
     extensions[len(config.required_extensions)] = vk.KHR_SWAPCHAIN_EXTENSION_NAME
 
-    required_features := config.required_features
-    required_features.sType = .PHYSICAL_DEVICE_FEATURES_2
+    required_features := config.physical_device.required_features
+    assert(required_features.sType == .PHYSICAL_DEVICE_FEATURES_2)
 
     device_create_info := vk.DeviceCreateInfo{
         sType                   = .DEVICE_CREATE_INFO,

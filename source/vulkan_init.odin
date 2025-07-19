@@ -1,0 +1,96 @@
+package vkguide
+
+import vk "vendor:vulkan"
+
+init_command_pool_crate_info :: proc(
+    queue_family_index: u32,
+    flags: vk.CommandPoolCreateFlags = {},
+) -> vk.CommandPoolCreateInfo {
+    return vk.CommandPoolCreateInfo{
+        sType = .COMMAND_POOL_CREATE_INFO,
+        pNext = nil,
+        queueFamilyIndex = queue_family_index,
+        flags = flags,
+    }
+}
+
+init_command_buffer_allocate_info :: proc(pool: vk.CommandPool, count: u32) -> vk.CommandBufferAllocateInfo {
+    return vk.CommandBufferAllocateInfo{
+        sType = .COMMAND_BUFFER_ALLOCATE_INFO,
+        pNext = nil,
+        commandPool = pool,
+        level = .PRIMARY,
+        commandBufferCount = count,
+    }
+}
+
+init_fence_create_info :: proc(flags: vk.FenceCreateFlags = {}) -> vk.FenceCreateInfo {
+    return vk.FenceCreateInfo{
+        sType = .FENCE_CREATE_INFO,
+        pNext = nil,
+        flags = flags,
+    }
+}
+
+init_semaphore_create_info :: proc() -> vk.SemaphoreCreateInfo {
+    return vk.SemaphoreCreateInfo{
+        sType = .SEMAPHORE_CREATE_INFO,
+        pNext = nil,
+        flags = {},
+    }
+}
+
+init_command_buffer_begin_info :: proc(flags := vk.CommandBufferUsageFlags{}) -> vk.CommandBufferBeginInfo {
+    return vk.CommandBufferBeginInfo{
+        sType = .COMMAND_BUFFER_BEGIN_INFO,
+        pNext = nil,
+        flags = flags,
+        pInheritanceInfo = nil,
+    }
+}
+
+init_subresource_range :: proc(aspect_mask := vk.ImageAspectFlags{}) -> vk.ImageSubresourceRange {
+    return vk.ImageSubresourceRange{
+        aspectMask = aspect_mask,
+        baseMipLevel = 0,
+        levelCount = vk.REMAINING_MIP_LEVELS,
+        baseArrayLayer = 0,
+        layerCount = vk.REMAINING_ARRAY_LAYERS,
+    }
+}
+
+init_semaphore_submit_info :: proc(stage_mask: vk.PipelineStageFlags2, semaphore: vk.Semaphore) -> vk.SemaphoreSubmitInfo {
+    return vk.SemaphoreSubmitInfo{
+        sType = .SEMAPHORE_SUBMIT_INFO,
+        pNext = nil,
+        stageMask = stage_mask,
+        semaphore = semaphore,
+        value = 1,
+    }
+}
+
+init_command_buffer_submit_info :: proc(cmd: vk.CommandBuffer) -> vk.CommandBufferSubmitInfo {
+    return vk.CommandBufferSubmitInfo{
+        sType = .COMMAND_BUFFER_SUBMIT_INFO,
+        pNext = nil,
+        commandBuffer = cmd,
+        deviceMask = 0,
+    }
+}
+
+init_submit_info :: proc(
+    cmd_buffer_submit_info: ^vk.CommandBufferSubmitInfo,
+    signal_semaphore_info: ^vk.SemaphoreSubmitInfo,
+    wait_semaphore_info: ^vk.SemaphoreSubmitInfo,
+) -> vk.SubmitInfo2 {
+    return vk.SubmitInfo2{
+        sType = .SUBMIT_INFO_2,
+        pNext = nil,
+        waitSemaphoreInfoCount = 1,
+        pWaitSemaphoreInfos = wait_semaphore_info,
+        commandBufferInfoCount = 1,
+        pCommandBufferInfos = cmd_buffer_submit_info,
+        signalSemaphoreInfoCount = 1,
+        pSignalSemaphoreInfos = signal_semaphore_info,
+    }
+}
