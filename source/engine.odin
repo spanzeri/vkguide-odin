@@ -1,11 +1,13 @@
 package vkguide
 
+import "base:runtime"
 import "core:log"
-import "core:time"
 import "core:math"
+import "core:time"
 
 import sdl "vendor:sdl3"
 import vk "vendor:vulkan"
+import vma "lib:vma"
 
 VulkanEngine :: struct {
     window:                             ^sdl.Window,
@@ -28,6 +30,8 @@ VulkanEngine :: struct {
 
     device:                             vk.Device,
 
+    allocator:                          vma.Allocator,
+
     graphics_queue_family_index:        u32,
     present_queue_family_index:         u32,
     compute_queue_family_index:         u32,
@@ -42,8 +46,13 @@ VulkanEngine :: struct {
     swapchain_image_views:              [dynamic]vk.ImageView,
     swapchain_extent:                   vk.Extent2D,
 
+    draw_image:                         Allocated_Image,
+    draw_image_extent:                  vk.Extent2D,
+
     frames:                             [INFLIGHT_FRAME_OVERLAP]Frame_Data,
     frame_number:                       u64,
+
+    deletion_queue:                     Deletion_Queue,
 }
 
 Engine_Init_Options :: struct {
@@ -57,6 +66,7 @@ Frame_Data :: struct {
     swapchain_semaphore:        vk.Semaphore,
     render_finished_semaphore:  vk.Semaphore,
     render_fence:               vk.Fence,
+    deletion_queue:             Deletion_Queue,
 }
 
 INFLIGHT_FRAME_OVERLAP :: 2
@@ -77,7 +87,7 @@ engine_init :: proc(
         return false
     }
 
-    self.window = sdl.CreateWindow("Vulkan Engine", 1024, 768, sdl.WINDOW_VULKAN)
+    self.window = sdl.CreateWindow("Vulkan Engine", opts.window_size.x, opts.window_size.y, sdl.WINDOW_VULKAN)
     if self.window == nil {
         log.error("Failed to create SDL window: %s", sdl.GetError())
         return false
@@ -138,7 +148,11 @@ engine_shutdown :: proc(self: ^VulkanEngine) {
             vk.DestroyCommandPool(self.device, self.frames[i].command_pool, nil)
             self.frames[i].command_pool = 0
         }
+
+        deletion_queue_destroy(&self.frames[i].deletion_queue)
     }
+
+    deletion_queue_destroy(&self.deletion_queue)
 
     if self.device != nil {
         vk.DestroyDevice(self.device, nil)
@@ -198,6 +212,9 @@ engine_draw :: proc(self: ^VulkanEngine) -> (ok: bool) {
     frame := _get_current_frame(self)
     one_sec := u64(1e9)
     vk_check(vk.WaitForFences(self.device, 1, &frame.render_fence, true, one_sec)) or_return
+
+    deletion_queue_flush(&frame.deletion_queue)
+
     vk_check(vk.ResetFences(self.device, 1, &frame.render_fence)) or_return
 
     image_index: u32
@@ -218,20 +235,38 @@ engine_draw :: proc(self: ^VulkanEngine) -> (ok: bool) {
     cmd_begin_info := init_command_buffer_begin_info({ .ONE_TIME_SUBMIT })
     vk_check(vk.BeginCommandBuffer(cmd, &cmd_begin_info)) or_return
 
-    // Transition the swapchain image to GENERAL layout
-    vkutil_transition_image(cmd, self.swapchain_images[image_index], .UNDEFINED, .GENERAL)
+    // Prepare to draw to the render image
+    self.draw_image_extent.width  = self.draw_image.extent.width
+    self.draw_image_extent.height = self.draw_image.extent.height
 
-    // Make a clear color for the image
-    flash := math.abs(math.sin(f32(self.frame_number) / f32(120)))
-    clear_color := vk.ClearColorValue{ float32 = [4]f32{0.0, 0.0, flash, 1.0} }
+    image_transition(cmd, self.draw_image.image, .UNDEFINED, .GENERAL)
 
-    clear_range := init_subresource_range({ .COLOR })
+    // Draw background color
+    {
+        // Make a clear color for the image
+        flash := math.abs(math.sin(f32(self.frame_number) / f32(120)))
+        clear_color := vk.ClearColorValue{ float32 = [4]f32{0.0, 0.0, flash, 1.0} }
 
-    // Clear the image
-    vk.CmdClearColorImage(cmd, self.swapchain_images[image_index], .GENERAL, &clear_color, 1, &clear_range)
+        clear_range := init_subresource_range({ .COLOR })
+
+        // Clear the image
+        vk.CmdClearColorImage(cmd, self.draw_image.image, .GENERAL, &clear_color, 1, &clear_range)
+    }
 
     // Transition the image into something that can be presented
-    vkutil_transition_image(cmd, self.swapchain_images[image_index], .GENERAL, .PRESENT_SRC_KHR)
+    image_transition(cmd, self.draw_image.image, .GENERAL, .TRANSFER_SRC_OPTIMAL)
+    image_transition(cmd, self.swapchain_images[image_index], .UNDEFINED, .TRANSFER_DST_OPTIMAL)
+
+    copy_image_to_image(
+        cmd,
+        self.draw_image.image,
+        self.swapchain_images[image_index],
+        self.draw_image_extent,
+        self.swapchain_extent,
+    )
+
+    // Transition the swapchain image to a layout that can be presented
+    image_transition(cmd, self.swapchain_images[image_index], .TRANSFER_DST_OPTIMAL, .PRESENT_SRC_KHR)
 
     vk_check(vk.EndCommandBuffer(cmd)) or_return
 
@@ -359,12 +394,90 @@ _init_vulkan :: proc(self: ^VulkanEngine) -> (ok: bool) {
         log.info("Logical device created successfully")
     }
 
+    //
+    // Init deletion queue
+    //
+
+    deletion_queue_init(&self.deletion_queue, self.device, context.allocator)
+
+    //
+    // Create VMA allocator
+    //
+    {
+        vma_vulkan_functions := vma.create_vulkan_functions()
+        vma_config := vma.Allocator_Create_Info{
+            physical_device  = self.physical_device,
+            device           = self.device,
+            instance         = self.instance,
+            flags            = { .BufferDeviceAddress },
+            vulkan_functions = &vma_vulkan_functions,
+        }
+
+        if vma.create_allocator(vma_config, &self.allocator) != .SUCCESS {
+            log.error("Failed to create VMA allocator")
+            return false
+        }
+
+        deletion_queue_push(&self.deletion_queue, self.allocator)
+    }
+
     return true
 }
 
 @(private="file")
 _init_swapchain :: proc(self: ^VulkanEngine) -> (ok: bool) {
-    return _create_swapchain(self, self.window_extent.width, self.window_extent.height)
+    if !_create_swapchain(self, self.window_extent.width, self.window_extent.height) {
+        log.error("Failed to create Vulkan swapchain")
+        return false
+    }
+
+    draw_image_extent := vk.Extent3D{
+        width  = self.window_extent.width,
+        height = self.window_extent.height,
+        depth  = 1,
+    }
+
+    self.draw_image.format = .R16G16B16A16_SFLOAT
+    self.draw_image.extent = draw_image_extent
+
+    draw_image_usage_flags :vk.ImageUsageFlags= { .TRANSFER_SRC, .TRANSFER_DST, .STORAGE, .COLOR_ATTACHMENT }
+
+    image_create_info := init_image_create_info(
+        self.draw_image.format,
+        draw_image_usage_flags,
+        draw_image_extent,
+    )
+
+    alloc_info := vma.Allocation_Create_Info{
+        usage          = .GPUOnly,
+        required_flags = { .DEVICE_LOCAL },
+    }
+
+    vk_check(
+        vma.create_image(
+            self.allocator,
+            image_create_info,
+            alloc_info,
+            &self.draw_image.image,
+            &self.draw_image.allocation,
+            nil,
+        ),
+    ) or_return
+    defer if !ok {
+        vma.destroy_image(self.allocator, self.draw_image.image, nil)
+    }
+
+    image_view_create_info := init_image_view_create_info(
+        self.draw_image.format,
+        self.draw_image.image,
+        { .COLOR },
+    )
+
+    vk_check(vk.CreateImageView(self.device, &image_view_create_info, nil, &self.draw_image.view)) or_return
+
+    deletion_queue_push(&self.deletion_queue, Image_With_Allocator{ self.draw_image, self.allocator })
+
+    return true
 }
 
 @(private="file")
@@ -477,3 +590,85 @@ _get_current_frame :: proc(self: ^VulkanEngine) -> (frame: ^Frame_Data) {
     return &self.frames[frame_index]
 }
 
+//
+// Deletion queue
+//
+
+Deletion_Queue :: struct {
+    device:     vk.Device,
+    resources:  [dynamic]Delete_Resource,
+}
+
+Image_With_Allocator :: struct {
+    image:      Allocated_Image,
+    allocator:  vma.Allocator,
+}
+
+Delete_Resource :: union {
+    proc "c" (),
+
+    vk.Pipeline,
+    vk.PipelineLayout,
+
+    vk.DescriptorSetLayout,
+    vk.DescriptorPool,
+
+    vk.ImageView,
+    vk.Sampler,
+
+    vk.CommandPool,
+
+    vk.Fence,
+    vk.Semaphore,
+
+    vk.Buffer,
+    vk.DeviceMemory,
+
+    vma.Allocator,
+
+    Image_With_Allocator,
+}
+
+deletion_queue_init :: proc(
+    self: ^Deletion_Queue,
+    device: vk.Device,
+    allocator: runtime.Allocator = context.allocator,
+) {
+    self.device = device
+    self.resources = make_dynamic_array_len_cap([dynamic]Delete_Resource, 0, 128, allocator)
+}
+
+deletion_queue_destroy :: proc(self: ^Deletion_Queue) {
+    assert(self != nil)
+    deletion_queue_flush(self)
+    delete_dynamic_array(self.resources)
+}
+
+deletion_queue_push :: proc(self: ^Deletion_Queue, resource: Delete_Resource) {
+    append(&self.resources, resource)
+}
+
+deletion_queue_flush :: proc(self: ^Deletion_Queue) {
+    assert(self != nil)
+    #reverse for &resource in self.resources {
+        switch &res in resource {
+        case proc "c" ():            { res()                                                 }
+        case vk.Pipeline:            { vk.DestroyPipeline(self.device, res, nil)             }
+        case vk.PipelineLayout:      { vk.DestroyPipelineLayout(self.device, res, nil)       }
+        case vk.DescriptorSetLayout: { vk.DestroyDescriptorSetLayout(self.device, res, nil)  }
+        case vk.DescriptorPool:      { vk.DestroyDescriptorPool(self.device, res, nil)       }
+        case vk.ImageView:           { vk.DestroyImageView(self.device, res, nil)            }
+        case vk.Sampler:             { vk.DestroySampler(self.device, res, nil)              }
+        case vk.CommandPool:         { vk.DestroyCommandPool(self.device, res, nil)          }
+        case vk.Fence:               { vk.DestroyFence(self.device, res, nil)                }
+        case vk.Semaphore:           { vk.DestroySemaphore(self.device, res, nil)            }
+        case vk.Buffer:              { vk.DestroyBuffer(self.device, res, nil)               }
+        case vk.DeviceMemory:        { vk.FreeMemory(self.device, res, nil)                  }
+        case vma.Allocator:          { vma.destroy_allocator(res)                            }
+        case Image_With_Allocator:   { image_destroy(&res.image, self.device, res.allocator) }
+        case: {
+            assert(false, "Unknown resource type in deletion queue")
+        }
+        }
+    }
+}

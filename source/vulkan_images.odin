@@ -1,8 +1,17 @@
 package vkguide
 
 import vk "vendor:vulkan"
+import vma "lib:vma"
 
-vkutil_transition_image :: proc(cmd: vk.CommandBuffer, image: vk.Image, current_layout, new_layout: vk.ImageLayout) {
+Allocated_Image :: struct {
+    image:      vk.Image,
+    view:       vk.ImageView,
+    allocation: vma.Allocation,
+    extent:     vk.Extent3D,
+    format:     vk.Format,
+}
+
+image_transition :: proc(cmd: vk.CommandBuffer, image: vk.Image, current_layout, new_layout: vk.ImageLayout) {
     is_depth :=
         (new_layout == .DEPTH_STENCIL_ATTACHMENT_OPTIMAL || current_layout == .DEPTH_ATTACHMENT_OPTIMAL)
 
@@ -29,3 +38,58 @@ vkutil_transition_image :: proc(cmd: vk.CommandBuffer, image: vk.Image, current_
     vk.CmdPipelineBarrier2(cmd, &dependency_info)
 }
 
+image_destroy :: proc(
+    allocated_image: ^Allocated_Image,
+    device: vk.Device,
+    allocator: vma.Allocator,
+) {
+    if allocated_image.view != 0 {
+        vk.DestroyImageView(device, allocated_image.view, nil)
+    }
+    vma.destroy_image(allocator, allocated_image.image, allocated_image.allocation)
+}
+
+copy_image_to_image :: proc(
+    cmd: vk.CommandBuffer,
+    src_image: vk.Image,
+    dst_image: vk.Image,
+    src_extent: vk.Extent2D,
+    dst_extent: vk.Extent2D,
+) {
+    blit_region := vk.ImageBlit2{
+        sType = .IMAGE_BLIT_2,
+        srcOffsets = {
+            { 0, 0, 0 },
+            { i32(src_extent.width), i32(src_extent.height), 1 },
+        },
+        dstOffsets = {
+            { 0, 0, 0 },
+            { i32(src_extent.width), i32(src_extent.height), 1 },
+        },
+        srcSubresource = {
+            aspectMask = { .COLOR },
+            baseArrayLayer = 0,
+            layerCount = 1,
+            mipLevel = 0,
+        },
+        dstSubresource = {
+            aspectMask = { .COLOR },
+            baseArrayLayer = 0,
+            layerCount = 1,
+            mipLevel = 0,
+        },
+    }
+
+    blit_info := vk.BlitImageInfo2{
+        sType = .BLIT_IMAGE_INFO_2,
+        dstImage = dst_image,
+        srcImage = src_image,
+        dstImageLayout = .TRANSFER_DST_OPTIMAL,
+        srcImageLayout = .TRANSFER_SRC_OPTIMAL,
+        filter = .LINEAR,
+        regionCount = 1,
+        pRegions = &blit_region,
+    }
+
+    vk.CmdBlitImage2(cmd, &blit_info)
+}

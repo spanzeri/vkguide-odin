@@ -733,7 +733,7 @@ vkbootstrap_init_swapchain_config :: proc(
             colorSpace = .SRGB_NONLINEAR,
         },
         desired_present_mode = .FIFO,
-        desired_extent = vk.Extent2D{ width = 800, height = 600 },
+        desired_extent = vk.Extent2D{ width = width, height = height },
         old_swapchain = 0,
     }
 }
