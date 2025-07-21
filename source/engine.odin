@@ -4,10 +4,19 @@ import "base:runtime"
 import "core:log"
 import "core:math"
 import "core:time"
+import "core:os"
+
+// @NOTE: I couldn't find a better way to silence the compiler warning about
+// os not being used if FORCE_X11_VIDEO below is not defined.
+_ :: os.set_env
 
 import sdl "vendor:sdl3"
 import vk "vendor:vulkan"
 import vma "lib:vma"
+
+when ODIN_OS == .Linux {
+    FORCE_X11_VIDEO_DRIVER :: #config(FORCE_X11_VIDEO, false)
+}
 
 VulkanEngine :: struct {
     window:                             ^sdl.Window,
@@ -44,10 +53,19 @@ VulkanEngine :: struct {
     swapchain:                          vk.SwapchainKHR,
     swapchain_images:                   [dynamic]vk.Image,
     swapchain_image_views:              [dynamic]vk.ImageView,
+    swapchain_present_semaphores:       [dynamic]vk.Semaphore,
     swapchain_extent:                   vk.Extent2D,
 
     draw_image:                         Allocated_Image,
     draw_image_extent:                  vk.Extent2D,
+
+    global_descriptor_allocator:        vk.DescriptorPool,
+
+    draw_image_descriptor_set:          vk.DescriptorSet,
+    draw_image_descriptor_set_layout:   vk.DescriptorSetLayout,
+
+    gradient_pipeline:                  vk.Pipeline,
+    gradient_pipeline_layout:           vk.PipelineLayout,
 
     frames:                             [INFLIGHT_FRAME_OVERLAP]Frame_Data,
     frame_number:                       u64,
@@ -64,7 +82,6 @@ Frame_Data :: struct {
     command_pool:               vk.CommandPool,
     main_command_buffer:        vk.CommandBuffer,
     swapchain_semaphore:        vk.Semaphore,
-    render_finished_semaphore:  vk.Semaphore,
     render_fence:               vk.Fence,
     deletion_queue:             Deletion_Queue,
 }
@@ -81,6 +98,10 @@ engine_init :: proc(
 ) -> (ok: bool) {
     assert(self != nil, "VulkanEngine cannot be nil")
     assert(self.window == nil, "VulkanEngine window must be nil on initialization")
+
+    when ODIN_OS == .Linux && FORCE_X11_VIDEO_DRIVER {
+        os.set_env("SDL_VIDEODRIVER", "x11")
+    }
 
     if !sdl.Init(sdl.INIT_VIDEO) {
         log.error("Failed to initialize SDL: %v", sdl.GetError())
@@ -118,6 +139,16 @@ engine_init :: proc(
         return false
     }
 
+    if !_init_descriptors(self) {
+        log.error("Failed to initialize Vulkan descriptors")
+        return false
+    }
+
+    if !_init_pipelines(self) {
+        log.error("Failed to initialize Vulkan pipelines")
+        return false
+    }
+
     return true
 }
 
@@ -130,10 +161,6 @@ engine_shutdown :: proc(self: ^VulkanEngine) {
             vk.WaitForFences(self.device, 1, &self.frames[i].render_fence, true, u64(1e9))
             vk.DestroyFence(self.device, self.frames[i].render_fence, nil)
             self.frames[i].render_fence = 0
-        }
-        if self.frames[i].render_finished_semaphore != 0 {
-            vk.DestroySemaphore(self.device, self.frames[i].render_finished_semaphore, nil)
-            self.frames[i].render_finished_semaphore = 0
         }
         if self.frames[i].swapchain_semaphore != 0 {
             vk.DestroySemaphore(self.device, self.frames[i].swapchain_semaphore, nil)
@@ -241,8 +268,9 @@ engine_draw :: proc(self: ^VulkanEngine) -> (ok: bool) {
 
     image_transition(cmd, self.draw_image.image, .UNDEFINED, .GENERAL)
 
-    // Draw background color
-    {
+    // Draw background ...
+    if false {
+        // ... Either with a clear
         // Make a clear color for the image
         flash := math.abs(math.sin(f32(self.frame_number) / f32(120)))
         clear_color := vk.ClearColorValue{ float32 = [4]f32{0.0, 0.0, flash, 1.0} }
@@ -251,6 +279,20 @@ engine_draw :: proc(self: ^VulkanEngine) -> (ok: bool) {
 
         // Clear the image
         vk.CmdClearColorImage(cmd, self.draw_image.image, .GENERAL, &clear_color, 1, &clear_range)
+    } else {
+        // ... Or with a compute shader
+        vk.CmdBindPipeline(cmd, .COMPUTE, self.gradient_pipeline)
+
+        // Bind the descriptor set for the draw image
+        vk.CmdBindDescriptorSets(cmd, .COMPUTE, self.gradient_pipeline_layout, 0, 1, &self.draw_image_descriptor_set, 0, nil)
+
+        // Dispatch the compute shader to fill the image
+        vk.CmdDispatch(
+            cmd,
+            u32(math.ceil_f32(f32(self.draw_image_extent.width)  / 16.0)),
+            u32(math.ceil_f32(f32(self.draw_image_extent.height) / 16.0)),
+            1,
+        )
     }
 
     // Transition the image into something that can be presented
@@ -274,7 +316,7 @@ engine_draw :: proc(self: ^VulkanEngine) -> (ok: bool) {
     // We want to wait on the present semaphore, and signal the render finished semaphore.
     cmd_info    := init_command_buffer_submit_info(cmd)
     wait_info   := init_semaphore_submit_info({ .COLOR_ATTACHMENT_OUTPUT }, frame.swapchain_semaphore)
-    signal_info := init_semaphore_submit_info({ .ALL_GRAPHICS }, frame.render_finished_semaphore)
+    signal_info := init_semaphore_submit_info({ .ALL_GRAPHICS }, self.swapchain_present_semaphores[image_index])
 
     submit_info := init_submit_info(&cmd_info, &signal_info, &wait_info)
 
@@ -287,7 +329,7 @@ engine_draw :: proc(self: ^VulkanEngine) -> (ok: bool) {
         pNext =              nil,
         pSwapchains =         &self.swapchain,
         swapchainCount =     1,
-        pWaitSemaphores =    &frame.render_finished_semaphore,
+        pWaitSemaphores =    &self.swapchain_present_semaphores[image_index],
         waitSemaphoreCount = 1,
         pImageIndices =      &image_index,
     }
@@ -513,11 +555,26 @@ _create_swapchain :: proc(self: ^VulkanEngine, width, height: u32) -> (ok: bool)
     self.swapchain_image_views = bootstrap_swapchain.image_views
     self.swapchain_extent      = bootstrap_swapchain.extent
 
+    self.swapchain_present_semaphores = make_dynamic_array_len(
+        [dynamic]vk.Semaphore,
+        len(self.swapchain_images),
+        context.allocator,
+    )
+
+    for i in 0 ..< len(self.swapchain_images) {
+        semaphore_create_info := init_semaphore_create_info()
+        vk_check(vk.CreateSemaphore(self.device, &semaphore_create_info, nil, &self.swapchain_present_semaphores[i])) or_return
+    }
+
     return true
 }
 
 @(private="file")
 _destroy_swapchain :: proc(self: ^VulkanEngine) {
+    for swapchain_present_semaphore in self.swapchain_present_semaphores {
+        vk.DestroySemaphore(self.device, swapchain_present_semaphore, nil)
+    }
+    delete_dynamic_array(self.swapchain_present_semaphores)
     for swapchain_image_view in self.swapchain_image_views {
         vk.DestroyImageView(self.device, swapchain_image_view, nil)
     }
@@ -576,9 +633,141 @@ _init_sync_structures :: proc(self: ^VulkanEngine) -> (ok: bool) {
         vk_check(
             vk.CreateSemaphore(self.device, &semaphore_create_info, nil, &self.frames[i].swapchain_semaphore),
         ) or_return
-        vk_check(
-            vk.CreateSemaphore(self.device, &semaphore_create_info, nil, &self.frames[i].render_finished_semaphore),
-        ) or_return
+    }
+
+    return true
+}
+
+@(private="file")
+_init_descriptors :: proc(self: ^VulkanEngine) -> (ok: bool) {
+    ratios := []Pool_Size_Ratio{
+        { type = .STORAGE_IMAGE, ratio = 1.0 },
+    }
+
+    self.global_descriptor_allocator = descriptor_pool_init(self.device, 10, ratios)
+
+    // Make the descriptor set layout for the compute draw
+    {
+        builder := descriptor_layout_builder_init()
+        defer descriptor_layout_builder_destroy(&builder)
+
+        descriptor_layout_builder_add_binding(&builder, 0, .STORAGE_IMAGE)
+
+        self.draw_image_descriptor_set_layout = descriptor_layout_builder_build(
+            &builder,
+            self.device,
+            { .COMPUTE },
+        )
+    }
+
+    // Make sure we delete the descriptor set layout and pool at shutdown
+
+    deletion_queue_push(&self.deletion_queue, self.global_descriptor_allocator)
+    deletion_queue_push(&self.deletion_queue, self.draw_image_descriptor_set_layout)
+
+    // Allocate the descriptor set for the draw image
+    {
+        self.draw_image_descriptor_set = descriptor_pool_allocate(
+            self.global_descriptor_allocator,
+            self.device,
+            self.draw_image_descriptor_set_layout,
+        )
+        if self.draw_image_descriptor_set == 0 {
+            log.error("Failed to allocate descriptor set for draw image")
+            return false
+        }
+
+        image_info := vk.DescriptorImageInfo{
+            imageLayout = .GENERAL,
+            imageView = self.draw_image.view,
+        }
+
+        draw_image_write := vk.WriteDescriptorSet{
+            sType = .WRITE_DESCRIPTOR_SET,
+            dstBinding = 0,
+            dstSet = self.draw_image_descriptor_set,
+            descriptorCount = 1,
+            descriptorType = .STORAGE_IMAGE,
+            pImageInfo = &image_info,
+        }
+
+        vk.UpdateDescriptorSets(self.device, 1, &draw_image_write, 0, nil)
+    }
+
+    return true
+}
+
+@(private="file")
+_init_pipelines :: proc(self: ^VulkanEngine) -> (ok: bool) {
+    if !_init_background_pipelines(self) {
+        log.error("Failed to initialize background compute pipelines")
+        return false
+    }
+
+    return true
+}
+
+@(private="file")
+_init_background_pipelines :: proc(self: ^VulkanEngine) -> (ok: bool) {
+    // Create gradient compute pipeline layout
+    {
+        compute_pipeline_layout_create_info := vk.PipelineLayoutCreateInfo{
+            sType          = .PIPELINE_LAYOUT_CREATE_INFO,
+            pSetLayouts    = &self.draw_image_descriptor_set_layout,
+            setLayoutCount = 1,
+        }
+
+        if !vk_check(vk.CreatePipelineLayout(
+            self.device,
+            &compute_pipeline_layout_create_info,
+            nil,
+            &self.gradient_pipeline_layout,
+        )) {
+            log.error("Failed to create gradient compute pipeline layout")
+            return false
+        }
+
+        deletion_queue_push(&self.deletion_queue, self.gradient_pipeline_layout)
+    }
+
+    // Create gradient compute pipeline
+    {
+        compute_shader_mod : vk.ShaderModule
+        compute_shader_mod, ok = load_shader_module(self.device, "bin/shaders/gradient.comp.spv")
+        if !ok {
+            log.error("Failed to load gradient compute shader module")
+            return false
+        }
+        defer vk.DestroyShaderModule(self.device, compute_shader_mod, nil)
+
+        stage_create_info := vk.PipelineShaderStageCreateInfo{
+            sType = .PIPELINE_SHADER_STAGE_CREATE_INFO,
+            stage = { .COMPUTE },
+            module = compute_shader_mod,
+            pName = "main",
+        }
+
+        compute_pipeline_create_info := vk.ComputePipelineCreateInfo{
+            sType = .COMPUTE_PIPELINE_CREATE_INFO,
+            stage = stage_create_info,
+            layout = self.gradient_pipeline_layout,
+        }
+
+        if !vk_check(vk.CreateComputePipelines(
+            self.device,
+            0, // cache
+            1,
+            &compute_pipeline_create_info,
+            nil,
+            &self.gradient_pipeline,
+        )) {
+            log.error("Failed to create gradient compute pipeline")
+            return false
+        }
+
+        deletion_queue_push(&self.deletion_queue, self.gradient_pipeline)
+
+        log.infof("Gradient compute pipeline created successfully")
     }
 
     return true
