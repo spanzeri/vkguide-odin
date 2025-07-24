@@ -6,6 +6,17 @@ import "core:mem"
 
 start :: proc() -> (ok: bool) {
     engine := VulkanEngine{}
+
+    // !!Test code: BEGIN!!
+    ui_context: Ui_Context
+    ui_context, ok = ui_init(Ui_Config{})
+    if !ok {
+        log.errorf("Failed to initialize UI context")
+        return false
+    }
+    defer ui_shutdown(&ui_context)
+    // !!Test code: END!!
+
     if !engine_init(&engine) {
         return false
     }

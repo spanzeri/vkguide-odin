@@ -67,6 +67,14 @@ VulkanEngine :: struct {
     gradient_pipeline:                  vk.Pipeline,
     gradient_pipeline_layout:           vk.PipelineLayout,
 
+    triangle_pipeline:                  vk.Pipeline,
+    triangle_pipeline_layout:           vk.PipelineLayout,
+
+    // Immediate submit structures
+    immediate_fence:                    vk.Fence,
+    immediate_command_pool:             vk.CommandPool,
+    immediate_command_buffer:           vk.CommandBuffer,
+
     frames:                             [INFLIGHT_FRAME_OVERLAP]Frame_Data,
     frame_number:                       u64,
 
@@ -266,37 +274,16 @@ engine_draw :: proc(self: ^VulkanEngine) -> (ok: bool) {
     self.draw_image_extent.width  = self.draw_image.extent.width
     self.draw_image_extent.height = self.draw_image.extent.height
 
+    // Transition into GENERAL layout for drawing with compute
     image_transition(cmd, self.draw_image.image, .UNDEFINED, .GENERAL)
+    _draw_background(self, cmd)
 
-    // Draw background ...
-    if false {
-        // ... Either with a clear
-        // Make a clear color for the image
-        flash := math.abs(math.sin(f32(self.frame_number) / f32(120)))
-        clear_color := vk.ClearColorValue{ float32 = [4]f32{0.0, 0.0, flash, 1.0} }
-
-        clear_range := init_subresource_range({ .COLOR })
-
-        // Clear the image
-        vk.CmdClearColorImage(cmd, self.draw_image.image, .GENERAL, &clear_color, 1, &clear_range)
-    } else {
-        // ... Or with a compute shader
-        vk.CmdBindPipeline(cmd, .COMPUTE, self.gradient_pipeline)
-
-        // Bind the descriptor set for the draw image
-        vk.CmdBindDescriptorSets(cmd, .COMPUTE, self.gradient_pipeline_layout, 0, 1, &self.draw_image_descriptor_set, 0, nil)
-
-        // Dispatch the compute shader to fill the image
-        vk.CmdDispatch(
-            cmd,
-            u32(math.ceil_f32(f32(self.draw_image_extent.width)  / 16.0)),
-            u32(math.ceil_f32(f32(self.draw_image_extent.height) / 16.0)),
-            1,
-        )
-    }
+    // Transition into color attachment optimal for normal rendering
+    image_transition(cmd, self.draw_image.image, .GENERAL, .COLOR_ATTACHMENT_OPTIMAL)
+    _draw_geometry(self, cmd)
 
     // Transition the image into something that can be presented
-    image_transition(cmd, self.draw_image.image, .GENERAL, .TRANSFER_SRC_OPTIMAL)
+    image_transition(cmd, self.draw_image.image, .COLOR_ATTACHMENT_OPTIMAL, .TRANSFER_SRC_OPTIMAL)
     image_transition(cmd, self.swapchain_images[image_index], .UNDEFINED, .TRANSFER_DST_OPTIMAL)
 
     copy_image_to_image(
@@ -339,6 +326,96 @@ engine_draw :: proc(self: ^VulkanEngine) -> (ok: bool) {
     self.frame_number += 1
 
     return true
+}
+
+@(private="file")
+_draw_background :: proc(self: ^VulkanEngine, cmd: vk.CommandBuffer) {
+    // Draw background ...
+    if false {
+        // ... Either with a clear
+        // Make a clear color for the image
+        flash := math.abs(math.sin(f32(self.frame_number) / f32(120)))
+        clear_color := vk.ClearColorValue{ float32 = [4]f32{0.0, 0.0, flash, 1.0} }
+
+        clear_range := init_subresource_range({ .COLOR })
+
+        // Clear the image
+        vk.CmdClearColorImage(cmd, self.draw_image.image, .GENERAL, &clear_color, 1, &clear_range)
+    } else {
+        // ... Or with a compute shader
+        vk.CmdBindPipeline(cmd, .COMPUTE, self.gradient_pipeline)
+
+        // Bind the descriptor set for the draw image
+        vk.CmdBindDescriptorSets(cmd, .COMPUTE, self.gradient_pipeline_layout, 0, 1, &self.draw_image_descriptor_set, 0, nil)
+
+        // Push constants to the compute shader
+        pc := Compute_Push_Constants{
+            data1 = Vec4{ 1.0, 0.0, 0.0, 1.0 },
+            data2 = Vec4{ 0.0, 0.0, 1.0, 1.0 },
+        }
+        vk.CmdPushConstants(cmd, self.gradient_pipeline_layout, { .COMPUTE }, 0, size_of(Compute_Push_Constants), &pc)
+
+        // Dispatch the compute shader to fill the image
+        vk.CmdDispatch(
+            cmd,
+            u32(math.ceil_f32(f32(self.draw_image_extent.width)  / 16.0)),
+            u32(math.ceil_f32(f32(self.draw_image_extent.height) / 16.0)),
+            1,
+        )
+    }
+}
+
+@(private="file")
+_draw_geometry :: proc(self: ^VulkanEngine, cmd: vk.CommandBuffer) {
+    // Dynamic rendering setup
+    color_attachment := init_rendering_attachment_info(self.draw_image.view, nil)
+    render_info := init_rendering_info(self.draw_image_extent, &color_attachment, nil)
+
+    vk.CmdBeginRendering(cmd, &render_info)
+    defer vk.CmdEndRendering(cmd)
+
+    vk.CmdBindPipeline(cmd, .GRAPHICS, self.triangle_pipeline)
+
+    viewport := vk.Viewport{
+        x        = 0.0,
+        y        = f32(self.draw_image_extent.height),
+        width    = f32(self.draw_image_extent.width),
+        height   = -f32(self.draw_image_extent.height),
+        minDepth = 0.0,
+        maxDepth = 1.0,
+    }
+    vk.CmdSetViewport(cmd, 0, 1, &viewport)
+
+    scissor := vk.Rect2D{
+        offset = { 0, 0 },
+        extent = self.draw_image_extent,
+    }
+    vk.CmdSetScissor(cmd, 0, 1, &scissor)
+
+    vk.CmdDraw(cmd, 3, 1, 0, 0)
+}
+
+@(private="file")
+_immediate_submit :: proc(
+    self: ^VulkanEngine,
+    data: ^$Data_Type,
+    func: proc(cmd: vk.CommandBuffer, data: ^Data_Type),
+) {
+    vk_check(vk.ResetFences(self.device, 1, &self.immediate_fence)) or_return
+    vk_check(vk.ResetCommandBuffer(self.immediate_command_buffer, {})) or_return
+
+    cmd := self.immediate_command_buffer
+    cmd_begin_info := init_command_buffer_begin_info({ .ONE_TIME_SUBMIT })
+
+    vk_check(vk.BeginCommandBuffer(cmd, &cmd_begin_info)) or_return
+
+    func(cmd, data)
+
+    cmd_submit_info := init_command_buffer_submit_info(cmd)
+    submit_info := init_submit_info(&cmd_submit_info, nil, nil)
+
+    vk_check(vk.EndCommandBuffer(cmd)) or_return
+    vk_check(vk.QueueSubmit2(self.graphics_queue, 1, &submit_info, self.immediate_fence)) or_return
 }
 
 @(private="file")
@@ -619,6 +696,35 @@ _init_commands :: proc(self: ^VulkanEngine) -> (ok: bool) {
         }
     }
 
+    // Create the immediate command pool and buffer
+    {
+        if !vk_check(vk.CreateCommandPool(
+            self.device,
+            &command_pool_create_info,
+            nil,
+            &self.immediate_command_pool,
+        )) {
+            log.error("Failed to create immediate command pool")
+            return false
+        }
+
+        command_buffer_allocate_info := init_command_buffer_allocate_info(
+            self.immediate_command_pool,
+            1,
+        )
+
+        if !vk_check(vk.AllocateCommandBuffers(
+            self.device,
+            &command_buffer_allocate_info,
+            &self.immediate_command_buffer,
+        )) {
+            log.error("Failed to allocate immediate command buffer")
+            return false
+        }
+
+        deletion_queue_push(&self.deletion_queue, self.immediate_command_pool)
+    }
+
     log.info("Command pools and command buffers created successfully")
     return true
 }
@@ -634,6 +740,9 @@ _init_sync_structures :: proc(self: ^VulkanEngine) -> (ok: bool) {
             vk.CreateSemaphore(self.device, &semaphore_create_info, nil, &self.frames[i].swapchain_semaphore),
         ) or_return
     }
+
+    vk_check(vk.CreateFence(self.device, &fence_create_info, nil, &self.immediate_fence)) or_return
+    deletion_queue_push(&self.deletion_queue, self.immediate_fence)
 
     return true
 }
@@ -709,12 +818,20 @@ _init_pipelines :: proc(self: ^VulkanEngine) -> (ok: bool) {
 
 @(private="file")
 _init_background_pipelines :: proc(self: ^VulkanEngine) -> (ok: bool) {
-    // Create gradient compute pipeline layout
+    // Create gradient compute pipeline
     {
+        // Create the layout
+
         compute_pipeline_layout_create_info := vk.PipelineLayoutCreateInfo{
             sType          = .PIPELINE_LAYOUT_CREATE_INFO,
             pSetLayouts    = &self.draw_image_descriptor_set_layout,
             setLayoutCount = 1,
+            pPushConstantRanges = &vk.PushConstantRange{
+                offset     = 0,
+                size       = size_of(Compute_Push_Constants),
+                stageFlags = { .COMPUTE },
+            },
+            pushConstantRangeCount = 1,
         }
 
         if !vk_check(vk.CreatePipelineLayout(
@@ -728,10 +845,9 @@ _init_background_pipelines :: proc(self: ^VulkanEngine) -> (ok: bool) {
         }
 
         deletion_queue_push(&self.deletion_queue, self.gradient_pipeline_layout)
-    }
 
-    // Create gradient compute pipeline
-    {
+        // Load the shader module
+
         compute_shader_mod : vk.ShaderModule
         compute_shader_mod, ok = load_shader_module(self.device, "bin/shaders/gradient.comp.spv")
         if !ok {
@@ -739,6 +855,8 @@ _init_background_pipelines :: proc(self: ^VulkanEngine) -> (ok: bool) {
             return false
         }
         defer vk.DestroyShaderModule(self.device, compute_shader_mod, nil)
+
+        // Create the compute pipeline
 
         stage_create_info := vk.PipelineShaderStageCreateInfo{
             sType = .PIPELINE_SHADER_STAGE_CREATE_INFO,
@@ -768,6 +886,72 @@ _init_background_pipelines :: proc(self: ^VulkanEngine) -> (ok: bool) {
         deletion_queue_push(&self.deletion_queue, self.gradient_pipeline)
 
         log.infof("Gradient compute pipeline created successfully")
+    }
+
+    pipeline_builder := pipeline_builder_init()
+
+    // Create the triangle pipeline
+    {
+        // Create the pipeline layout
+
+        pipeline_layout_create_info := vk.PipelineLayoutCreateInfo{
+            sType = .PIPELINE_LAYOUT_CREATE_INFO,
+        }
+
+        if !vk_check(vk.CreatePipelineLayout(
+            self.device,
+            &pipeline_layout_create_info,
+            nil,
+            &self.triangle_pipeline_layout,
+        )) {
+            log.error("Failed to create triangle pipeline layout")
+            return false
+        }
+        deletion_queue_push(&self.deletion_queue, self.triangle_pipeline_layout)
+
+        // Load the shader modules
+
+        vertex_shader_mod : vk.ShaderModule
+        vertex_shader_mod, ok = load_shader_module(self.device, "bin/shaders/colored_triangle.vert.spv")
+        if !ok {
+            log.error("Failed to load triangle vertex shader module")
+            return false
+        }
+        defer vk.DestroyShaderModule(self.device, vertex_shader_mod, nil)
+        fragment_shader_mod : vk.ShaderModule
+        fragment_shader_mod, ok = load_shader_module(self.device, "bin/shaders/colored_triangle.frag.spv")
+        if !ok {
+            log.error("Failed to load triangle fragment shader module")
+            return false
+        }
+        defer vk.DestroyShaderModule(self.device, fragment_shader_mod, nil)
+
+        // Create the graphics pipeline
+
+        pipeline_builder_set_shaders(&pipeline_builder, {
+            { stage = .VERTEX,   module = vertex_shader_mod, },
+            { stage = .FRAGMENT, module = fragment_shader_mod, },
+        })
+
+        pipeline_builder.pipeline_layout = self.triangle_pipeline_layout
+
+        pipeline_builder_set_input_topology(&pipeline_builder, .TRIANGLE_LIST)
+        pipeline_builder_set_polygon_mode(&pipeline_builder, .FILL)
+        pipeline_builder_set_cull_mode(&pipeline_builder,  { .BACK })
+        pipeline_builder_disable_multisampling(&pipeline_builder)
+        pipeline_builder_disable_blending(&pipeline_builder)
+        pipeline_builder_disable_depth_test(&pipeline_builder)
+
+        pipeline_builder_set_color_attachment_format(&pipeline_builder, self.draw_image.format)
+        pipeline_builder_set_depth_format(&pipeline_builder, .UNDEFINED)
+
+        self.triangle_pipeline, ok = pipeline_builder_build(&pipeline_builder, self.device)
+        if !ok {
+            log.error("Failed to create triangle graphics pipeline")
+            return false
+        }
+
+        deletion_queue_push(&self.deletion_queue, self.triangle_pipeline)
     }
 
     return true
@@ -861,3 +1045,15 @@ deletion_queue_flush :: proc(self: ^Deletion_Queue) {
         }
     }
 }
+
+//
+// Gradient shader push constants
+//
+
+Compute_Push_Constants :: struct {
+    data1: Vec4,
+    data2: Vec4,
+    data3: Vec4,
+    data4: Vec4,
+}
+

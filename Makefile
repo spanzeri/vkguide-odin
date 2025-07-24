@@ -32,6 +32,9 @@ vma:
 	@c++ -c 3rdparty/vma_impl.cpp -o build/vma/vma_impl.o -fno-exceptions -fno-rtti -std=c++20
 	@ar rcs build/libvma-3.3.0.a build/vma/vma_impl.o
 
+test:
+	@odin test source $(ARGS)
+
 shaders: $(SHADER_BINS)
 
 $(SHADER_BIN_DIR)/%.spv: $(SHADER_SRC_DIR)/%.glsl

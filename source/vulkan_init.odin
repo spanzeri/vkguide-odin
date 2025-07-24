@@ -134,3 +134,46 @@ init_image_view_create_info :: proc(
         },
     }
 }
+
+init_rendering_attachment_info :: proc(
+    view: vk.ImageView,
+    clear: Maybe(vk.ClearValue),
+    layout := vk.ImageLayout.COLOR_ATTACHMENT_OPTIMAL,
+) -> vk.RenderingAttachmentInfo {
+    info := vk.RenderingAttachmentInfo{
+        sType       = .RENDERING_ATTACHMENT_INFO,
+        pNext       = nil,
+        imageView   = view,
+        imageLayout = layout,
+        storeOp     = .STORE,
+    }
+
+    if clear_value, ok := clear.?; ok {
+        info.loadOp = .CLEAR
+        info.clearValue = clear_value
+    } else {
+        info.loadOp = .LOAD
+        info.clearValue = vk.ClearValue{}
+    }
+
+    return info
+}
+
+init_rendering_info :: proc(
+    extent: vk.Extent2D,
+    color_attachment: ^vk.RenderingAttachmentInfo,
+    depth_attachment: ^vk.RenderingAttachmentInfo,
+) -> vk.RenderingInfo {
+    return vk.RenderingInfo{
+        sType                = .RENDERING_INFO,
+        renderArea = {
+            offset = { 0, 0 },
+            extent = extent,
+        },
+        layerCount           = 1,
+        colorAttachmentCount = 1,
+        pColorAttachments    = color_attachment,
+        pDepthAttachment     = depth_attachment,
+        pStencilAttachment   = nil,
+    }
+}
