@@ -1,10 +1,12 @@
 package vkguide
 
 import "base:runtime"
+import intr "base:intrinsics"
 import "core:log"
 import "core:math"
-import "core:time"
 import "core:os"
+import "core:time"
+import la "core:math/linalg"
 
 // @NOTE: I couldn't find a better way to silence the compiler warning about
 // os not being used if FORCE_X11_VIDEO below is not defined.
@@ -15,10 +17,10 @@ import vk "vendor:vulkan"
 import vma "lib:vma"
 
 when ODIN_OS == .Linux {
-    FORCE_X11_VIDEO_DRIVER :: #config(FORCE_X11_VIDEO, false)
+    FORCE_X11_VIDEO_DRIVER :: #config(FORCE_X11_VIDEO, true)
 }
 
-VulkanEngine :: struct {
+Engine :: struct {
     window:                             ^sdl.Window,
     minimized:                          bool,
 
@@ -70,6 +72,12 @@ VulkanEngine :: struct {
     triangle_pipeline:                  vk.Pipeline,
     triangle_pipeline_layout:           vk.PipelineLayout,
 
+    mesh_pipeline:                      vk.Pipeline,
+    mesh_pipeline_layout:               vk.PipelineLayout,
+
+    rectangle:                          Gpu_Mesh_Buffers,
+    meshes:                             [dynamic]Mesh_Asset,
+
     // Immediate submit structures
     immediate_fence:                    vk.Fence,
     immediate_command_pool:             vk.CommandPool,
@@ -94,11 +102,36 @@ Frame_Data :: struct {
     deletion_queue:             Deletion_Queue,
 }
 
+Allocated_Buffer :: struct {
+    buffer:       vk.Buffer,
+    allocation:   vma.Allocation,
+    info:         vma.Allocation_Info,
+}
+
+Vertex :: struct {
+    position:   Vec3,
+    uv_x:       f32,
+    normal:     Vec3,
+    uv_y:       f32,
+    color:      Vec4,
+}
+
+Gpu_Mesh_Buffers :: struct {
+    index_buffer:           Allocated_Buffer,
+    vertex_buffer:          Allocated_Buffer,
+    vertex_buffer_address:  vk.DeviceAddress,
+}
+
+Gpu_Draw_Push_Constants :: struct {
+    world_matrix:   Mat4,
+    vertex_buffer:  vk.DeviceAddress,
+}
+
 INFLIGHT_FRAME_OVERLAP :: 2
 
 @(require_results)
 engine_init :: proc(
-    self: ^VulkanEngine,
+    self: ^Engine,
     opts: Engine_Init_Options = {
         title = "Vulkan Engine",
         window_size = Vec2i{1024, 768},
@@ -157,11 +190,24 @@ engine_init :: proc(
         return false
     }
 
+    if !_init_default_data(self) {
+        log.error("Failed to initialize default data")
+        return false
+    }
+
+    if !_load_meshes(self) {
+        log.error("Failed to load meshes")
+        return false
+    }
+
     return true
 }
 
-engine_shutdown :: proc(self: ^VulkanEngine) {
+engine_shutdown :: proc(self: ^Engine) {
     vk.DeviceWaitIdle(self.device)
+
+    delete_dynamic_array(self.meshes)
+
     _destroy_swapchain(self)
 
     for i in 0 ..< INFLIGHT_FRAME_OVERLAP {
@@ -184,10 +230,10 @@ engine_shutdown :: proc(self: ^VulkanEngine) {
             self.frames[i].command_pool = 0
         }
 
-        deletion_queue_destroy(&self.frames[i].deletion_queue)
+        deletion_queue_destroy(&self.frames[i].deletion_queue, self)
     }
 
-    deletion_queue_destroy(&self.deletion_queue)
+    deletion_queue_destroy(&self.deletion_queue, self)
 
     if self.device != nil {
         vk.DestroyDevice(self.device, nil)
@@ -217,7 +263,7 @@ engine_shutdown :: proc(self: ^VulkanEngine) {
     sdl.Quit()
 }
 
-engine_run :: proc(self: ^VulkanEngine) {
+engine_run :: proc(self: ^Engine) {
     for {
         free_all(context.temp_allocator)
 
@@ -242,13 +288,51 @@ engine_run :: proc(self: ^VulkanEngine) {
     }
 }
 
+create_buffer :: proc(
+    self: ^Engine,
+    alloc_size: u64,
+    usage: vk.BufferUsageFlags,
+    memory_usage: vma.Memory_Usage,
+) -> (allocated_buffer: Allocated_Buffer, ok: bool) {
+    buffer_info := vk.BufferCreateInfo{
+        sType       = .BUFFER_CREATE_INFO,
+        size        = vk.DeviceSize(alloc_size),
+        usage       = usage,
+        sharingMode = .EXCLUSIVE,
+    }
+
+    alloc_info := vma.Allocation_Create_Info{
+        usage = memory_usage,
+        flags = { .MAPPED },
+    }
+
+    vk_check(vma.create_buffer(
+        self.allocator,
+        buffer_info,
+        alloc_info,
+        &allocated_buffer.buffer,
+        &allocated_buffer.allocation,
+        &allocated_buffer.info,
+    )) or_return
+
+    return allocated_buffer, true
+}
+
+destroy_buffer :: proc(allocator: vma.Allocator, allocated_buffer: ^Allocated_Buffer) {
+    if allocated_buffer.buffer != 0 {
+        vma.destroy_buffer(allocator, allocated_buffer.buffer, allocated_buffer.allocation)
+        allocated_buffer.buffer = 0
+        allocated_buffer.allocation =nil
+    }
+}
+
 @(private="file")
-engine_draw :: proc(self: ^VulkanEngine) -> (ok: bool) {
+engine_draw :: proc(self: ^Engine) -> (ok: bool) {
     frame := _get_current_frame(self)
     one_sec := u64(1e9)
     vk_check(vk.WaitForFences(self.device, 1, &frame.render_fence, true, one_sec)) or_return
 
-    deletion_queue_flush(&frame.deletion_queue)
+    deletion_queue_flush(&frame.deletion_queue, self)
 
     vk_check(vk.ResetFences(self.device, 1, &frame.render_fence)) or_return
 
@@ -329,7 +413,7 @@ engine_draw :: proc(self: ^VulkanEngine) -> (ok: bool) {
 }
 
 @(private="file")
-_draw_background :: proc(self: ^VulkanEngine, cmd: vk.CommandBuffer) {
+_draw_background :: proc(self: ^Engine, cmd: vk.CommandBuffer) {
     // Draw background ...
     if false {
         // ... Either with a clear
@@ -366,15 +450,13 @@ _draw_background :: proc(self: ^VulkanEngine, cmd: vk.CommandBuffer) {
 }
 
 @(private="file")
-_draw_geometry :: proc(self: ^VulkanEngine, cmd: vk.CommandBuffer) {
+_draw_geometry :: proc(self: ^Engine, cmd: vk.CommandBuffer) {
     // Dynamic rendering setup
     color_attachment := init_rendering_attachment_info(self.draw_image.view, nil)
     render_info := init_rendering_info(self.draw_image_extent, &color_attachment, nil)
 
     vk.CmdBeginRendering(cmd, &render_info)
     defer vk.CmdEndRendering(cmd)
-
-    vk.CmdBindPipeline(cmd, .GRAPHICS, self.triangle_pipeline)
 
     viewport := vk.Viewport{
         x        = 0.0,
@@ -392,34 +474,101 @@ _draw_geometry :: proc(self: ^VulkanEngine, cmd: vk.CommandBuffer) {
     }
     vk.CmdSetScissor(cmd, 0, 1, &scissor)
 
+    // Draw triangle (hard-coded)
+    vk.CmdBindPipeline(cmd, .GRAPHICS, self.triangle_pipeline)
     vk.CmdDraw(cmd, 3, 1, 0, 0)
+
+    // Draw rectangle (mesh buffers)
+    vk.CmdBindPipeline(cmd, .GRAPHICS, self.mesh_pipeline)
+    vk.CmdPushConstants(
+        cmd,
+        self.mesh_pipeline_layout,
+        { .VERTEX },
+        0,
+        size_of(Gpu_Draw_Push_Constants),
+        &Gpu_Draw_Push_Constants{
+            world_matrix = la.identity_matrix(Mat4),
+            vertex_buffer = self.rectangle.vertex_buffer_address,
+        },
+    )
+    vk.CmdBindIndexBuffer(cmd, self.rectangle.index_buffer.buffer, 0, .UINT32)
+    vk.CmdDrawIndexed(cmd, 6, 1, 0, 0, 0)
+
+    view := la.matrix4_translate_f32({ 0, 0, -5 })
+    proj := la.matrix4_perspective_f32(
+        math.to_radians_f32(70.0),
+        f32(self.draw_image_extent.width) / f32(self.draw_image_extent.height),
+        0.1,
+        100.0)
+
+
+    // Draw meshes
+    for mesh, mi in self.meshes {
+        if mi != 2 { continue }
+        vk.CmdPushConstants(
+            cmd,
+            self.mesh_pipeline_layout,
+            { .VERTEX },
+            0,
+            size_of(Gpu_Draw_Push_Constants),
+            &Gpu_Draw_Push_Constants{
+                world_matrix  = proj * view,
+                vertex_buffer = mesh.mesh_buffers.vertex_buffer_address,
+            },
+        )
+
+        vk.CmdBindIndexBuffer(cmd, mesh.mesh_buffers.index_buffer.buffer, 0, .UINT32)
+
+        for surface in mesh.surfaces {
+            vk.CmdDrawIndexed(
+                cmd,
+                surface.count,
+                1,
+                surface.start_index,
+                0,
+                0)
+        }
+    }
 }
 
 @(private="file")
 _immediate_submit :: proc(
-    self: ^VulkanEngine,
+    self: ^Engine,
     data: ^$Data_Type,
-    func: proc(cmd: vk.CommandBuffer, data: ^Data_Type),
+    func: proc(self: ^Engine, cmd: vk.CommandBuffer, data: ^Data_Type),
 ) {
-    vk_check(vk.ResetFences(self.device, 1, &self.immediate_fence)) or_return
-    vk_check(vk.ResetCommandBuffer(self.immediate_command_buffer, {})) or_return
+    if !vk_check(vk.ResetFences(self.device, 1, &self.immediate_fence)) {
+        panic("Failed to reset immediate fence")
+    }
+    if !vk_check(vk.ResetCommandBuffer(self.immediate_command_buffer, {})) {
+        panic("Failed to reset immediate command buffer")
+    }
 
     cmd := self.immediate_command_buffer
     cmd_begin_info := init_command_buffer_begin_info({ .ONE_TIME_SUBMIT })
 
-    vk_check(vk.BeginCommandBuffer(cmd, &cmd_begin_info)) or_return
+    if !vk_check(vk.BeginCommandBuffer(cmd, &cmd_begin_info)) {
+        panic("Failed to begin immediate command buffer")
+    }
 
-    func(cmd, data)
+    func(self, cmd, data)
 
     cmd_submit_info := init_command_buffer_submit_info(cmd)
     submit_info := init_submit_info(&cmd_submit_info, nil, nil)
 
-    vk_check(vk.EndCommandBuffer(cmd)) or_return
-    vk_check(vk.QueueSubmit2(self.graphics_queue, 1, &submit_info, self.immediate_fence)) or_return
+    if !vk_check(vk.EndCommandBuffer(cmd)) {
+        panic("Failed to end immediate command buffer")
+    }
+    if !vk_check(vk.QueueSubmit2(self.graphics_queue, 1, &submit_info, self.immediate_fence)) {
+        panic("Failed to submit immediate command buffer")
+    }
+    if !vk_check(vk.WaitForFences(self.device, 1, &self.immediate_fence, true, u64(1e9))) {
+        panic("Failed to wait for immediate fence")
+    }
 }
 
 @(private="file")
-_init_vulkan :: proc(self: ^VulkanEngine) -> (ok: bool) {
+_init_vulkan :: proc(self: ^Engine) -> (ok: bool) {
     defer free_all(context.temp_allocator)
     log.info("Initializing Vulkan instance...")
 
@@ -544,7 +693,7 @@ _init_vulkan :: proc(self: ^VulkanEngine) -> (ok: bool) {
 }
 
 @(private="file")
-_init_swapchain :: proc(self: ^VulkanEngine) -> (ok: bool) {
+_init_swapchain :: proc(self: ^Engine) -> (ok: bool) {
     if !_create_swapchain(self, self.window_extent.width, self.window_extent.height) {
         log.error("Failed to create Vulkan swapchain")
         return false
@@ -568,7 +717,7 @@ _init_swapchain :: proc(self: ^VulkanEngine) -> (ok: bool) {
     )
 
     alloc_info := vma.Allocation_Create_Info{
-        usage          = .GPUOnly,
+        usage          = .GPU_ONLY,
         required_flags = { .DEVICE_LOCAL },
     }
 
@@ -594,13 +743,13 @@ _init_swapchain :: proc(self: ^VulkanEngine) -> (ok: bool) {
 
     vk_check(vk.CreateImageView(self.device, &image_view_create_info, nil, &self.draw_image.view)) or_return
 
-    deletion_queue_push(&self.deletion_queue, Image_With_Allocator{ self.draw_image, self.allocator })
+    deletion_queue_push(&self.deletion_queue, self.draw_image)
 
     return true
 }
 
 @(private="file")
-_create_swapchain :: proc(self: ^VulkanEngine, width, height: u32) -> (ok: bool) {
+_create_swapchain :: proc(self: ^Engine, width, height: u32) -> (ok: bool) {
     defer free_all(context.temp_allocator)
     log.info("Creating Vulkan swapchain...")
 
@@ -647,7 +796,7 @@ _create_swapchain :: proc(self: ^VulkanEngine, width, height: u32) -> (ok: bool)
 }
 
 @(private="file")
-_destroy_swapchain :: proc(self: ^VulkanEngine) {
+_destroy_swapchain :: proc(self: ^Engine) {
     for swapchain_present_semaphore in self.swapchain_present_semaphores {
         vk.DestroySemaphore(self.device, swapchain_present_semaphore, nil)
     }
@@ -664,7 +813,7 @@ _destroy_swapchain :: proc(self: ^VulkanEngine) {
 }
 
 @(private="file")
-_init_commands :: proc(self: ^VulkanEngine) -> (ok: bool) {
+_init_commands :: proc(self: ^Engine) -> (ok: bool) {
     command_pool_create_info := init_command_pool_crate_info(
         self.graphics_queue_family_index,
         { .RESET_COMMAND_BUFFER },
@@ -730,7 +879,7 @@ _init_commands :: proc(self: ^VulkanEngine) -> (ok: bool) {
 }
 
 @(private="file")
-_init_sync_structures :: proc(self: ^VulkanEngine) -> (ok: bool) {
+_init_sync_structures :: proc(self: ^Engine) -> (ok: bool) {
     fence_create_info := init_fence_create_info({ .SIGNALED })
     semaphore_create_info := init_semaphore_create_info()
 
@@ -748,7 +897,7 @@ _init_sync_structures :: proc(self: ^VulkanEngine) -> (ok: bool) {
 }
 
 @(private="file")
-_init_descriptors :: proc(self: ^VulkanEngine) -> (ok: bool) {
+_init_descriptors :: proc(self: ^Engine) -> (ok: bool) {
     ratios := []Pool_Size_Ratio{
         { type = .STORAGE_IMAGE, ratio = 1.0 },
     }
@@ -807,7 +956,7 @@ _init_descriptors :: proc(self: ^VulkanEngine) -> (ok: bool) {
 }
 
 @(private="file")
-_init_pipelines :: proc(self: ^VulkanEngine) -> (ok: bool) {
+_init_pipelines :: proc(self: ^Engine) -> (ok: bool) {
     if !_init_background_pipelines(self) {
         log.error("Failed to initialize background compute pipelines")
         return false
@@ -817,7 +966,7 @@ _init_pipelines :: proc(self: ^VulkanEngine) -> (ok: bool) {
 }
 
 @(private="file")
-_init_background_pipelines :: proc(self: ^VulkanEngine) -> (ok: bool) {
+_init_background_pipelines :: proc(self: ^Engine) -> (ok: bool) {
     // Create gradient compute pipeline
     {
         // Create the layout
@@ -918,6 +1067,7 @@ _init_background_pipelines :: proc(self: ^VulkanEngine) -> (ok: bool) {
             return false
         }
         defer vk.DestroyShaderModule(self.device, vertex_shader_mod, nil)
+
         fragment_shader_mod : vk.ShaderModule
         fragment_shader_mod, ok = load_shader_module(self.device, "bin/shaders/colored_triangle.frag.spv")
         if !ok {
@@ -954,11 +1104,115 @@ _init_background_pipelines :: proc(self: ^VulkanEngine) -> (ok: bool) {
         deletion_queue_push(&self.deletion_queue, self.triangle_pipeline)
     }
 
+    // Mesh pipeline
+    {
+        // Pipeline layout
+        pipeline_layout_create_info := vk.PipelineLayoutCreateInfo{
+            sType = .PIPELINE_LAYOUT_CREATE_INFO,
+            setLayoutCount = 0,
+            pSetLayouts = nil,
+            pushConstantRangeCount = 1,
+            pPushConstantRanges = &vk.PushConstantRange{
+                stageFlags = { .VERTEX },
+                offset     = 0,
+                size       = size_of(Gpu_Draw_Push_Constants),
+            },
+        }
+        if !vk_check(vk.CreatePipelineLayout(
+            self.device,
+            &pipeline_layout_create_info,
+            nil,
+            &self.mesh_pipeline_layout,
+        )) {
+            log.error("Failed to create mesh pipeline layout")
+            return false
+        }
+        deletion_queue_push(&self.deletion_queue, self.mesh_pipeline_layout)
+
+        // Shader modules
+        vertex_shader_mod : vk.ShaderModule
+        vertex_shader_mod, ok = load_shader_module(self.device, "bin/shaders/colored_triangle_mesh.vert.spv")
+        if !ok {
+            log.error("Failed to load mesh vertex shader module")
+            return false
+        }
+        defer vk.DestroyShaderModule(self.device, vertex_shader_mod, nil)
+
+        fragment_shader_mod : vk.ShaderModule
+        fragment_shader_mod, ok = load_shader_module(self.device, "bin/shaders/colored_triangle.frag.spv")
+        if !ok {
+            log.error("Failed to load mesh fragment shader module")
+            return false
+        }
+        defer vk.DestroyShaderModule(self.device, fragment_shader_mod, nil)
+
+        // Create the mesh pipeline layout
+        pipeline_builder_set_shaders(&pipeline_builder, {
+            { stage = .VERTEX,   module = vertex_shader_mod, },
+            { stage = .FRAGMENT, module = fragment_shader_mod, },
+        })
+        pipeline_builder.pipeline_layout = self.mesh_pipeline_layout
+
+        self.mesh_pipeline, ok = pipeline_builder_build(
+            &pipeline_builder,
+            self.device,
+            0,
+        )
+        if !ok {
+            log.error("Failed to create mesh graphics pipeline")
+            return false
+        }
+
+        deletion_queue_push(&self.deletion_queue, self.mesh_pipeline)
+    }
+
     return true
 }
 
 @(private="file")
-_get_current_frame :: proc(self: ^VulkanEngine) -> (frame: ^Frame_Data) {
+_init_default_data :: proc(self: ^Engine) -> (ok: bool) {
+    rect_vertices := [?]Vertex{
+        { position = Vec3{ 0.5, -0.5, 0.0}, uv_x = 0.0, color = Vec4{ 0.0, 0.0, 0.0, 1 }, uv_y = 0.0 },
+        { position = Vec3{ 0.5,  0.5, 0.0}, uv_x = 0.0, color = Vec4{ 0.5, 0.5, 0.5, 1 }, uv_y = 0.0 },
+        { position = Vec3{-0.5, -0.5, 0.0}, uv_x = 0.0, color = Vec4{ 1.0, 0.0, 0.0, 1 }, uv_y = 0.0 },
+        { position = Vec3{-0.5,  0.5, 0.0}, uv_x = 0.0, color = Vec4{ 0.0, 1.0, 0.0, 1 }, uv_y = 0.0 },
+    }
+
+    rect_indices := [?]u32{
+        0, 1, 2,
+        2, 1, 3,
+    }
+
+    self.rectangle, ok = engine_upload_mesh(self, rect_indices[:], rect_vertices[:])
+    assert(ok, "Failed to upload rectangle mesh")
+
+    deletion_queue_push(&self.deletion_queue, self.rectangle.vertex_buffer)
+    deletion_queue_push(&self.deletion_queue, self.rectangle.index_buffer)
+
+    return true
+}
+
+@(private="file")
+_load_meshes :: proc(self: ^Engine) -> (ok: bool) {
+    self.meshes, ok = loader_load_gltf_meshes(
+        self,
+        "assets/basicmesh.glb",
+    )
+
+    if !ok {
+        log.error("Failed to load meshes from glTF file")
+        return false
+    }
+
+    for mesh in self.meshes {
+        deletion_queue_push(&self.deletion_queue, mesh)
+    }
+
+    return true
+}
+
+@(private="file")
+_get_current_frame :: proc(self: ^Engine) -> (frame: ^Frame_Data) {
     frame_index := u32(self.frame_number % INFLIGHT_FRAME_OVERLAP)
     return &self.frames[frame_index]
 }
@@ -975,6 +1229,12 @@ Deletion_Queue :: struct {
 Image_With_Allocator :: struct {
     image:      Allocated_Image,
     allocator:  vma.Allocator,
+}
+
+Mesh_With_Allocator :: struct {
+    vertex_buffer: Allocated_Buffer,
+    index_buffer:  Allocated_Buffer,
+    allocator:     vma.Allocator,
 }
 
 Delete_Resource :: union {
@@ -999,7 +1259,9 @@ Delete_Resource :: union {
 
     vma.Allocator,
 
-    Image_With_Allocator,
+    Allocated_Image,
+    Allocated_Buffer,
+    Mesh_Asset,
 }
 
 deletion_queue_init :: proc(
@@ -1011,9 +1273,9 @@ deletion_queue_init :: proc(
     self.resources = make_dynamic_array_len_cap([dynamic]Delete_Resource, 0, 128, allocator)
 }
 
-deletion_queue_destroy :: proc(self: ^Deletion_Queue) {
+deletion_queue_destroy :: proc(self: ^Deletion_Queue, engine: ^Engine) {
     assert(self != nil)
-    deletion_queue_flush(self)
+    deletion_queue_flush(self, engine)
     delete_dynamic_array(self.resources)
 }
 
@@ -1021,27 +1283,27 @@ deletion_queue_push :: proc(self: ^Deletion_Queue, resource: Delete_Resource) {
     append(&self.resources, resource)
 }
 
-deletion_queue_flush :: proc(self: ^Deletion_Queue) {
+deletion_queue_flush :: proc(self: ^Deletion_Queue, engine: ^Engine) {
     assert(self != nil)
     #reverse for &resource in self.resources {
         switch &res in resource {
-        case proc "c" ():            { res()                                                 }
-        case vk.Pipeline:            { vk.DestroyPipeline(self.device, res, nil)             }
-        case vk.PipelineLayout:      { vk.DestroyPipelineLayout(self.device, res, nil)       }
-        case vk.DescriptorSetLayout: { vk.DestroyDescriptorSetLayout(self.device, res, nil)  }
-        case vk.DescriptorPool:      { vk.DestroyDescriptorPool(self.device, res, nil)       }
-        case vk.ImageView:           { vk.DestroyImageView(self.device, res, nil)            }
-        case vk.Sampler:             { vk.DestroySampler(self.device, res, nil)              }
-        case vk.CommandPool:         { vk.DestroyCommandPool(self.device, res, nil)          }
-        case vk.Fence:               { vk.DestroyFence(self.device, res, nil)                }
-        case vk.Semaphore:           { vk.DestroySemaphore(self.device, res, nil)            }
-        case vk.Buffer:              { vk.DestroyBuffer(self.device, res, nil)               }
-        case vk.DeviceMemory:        { vk.FreeMemory(self.device, res, nil)                  }
-        case vma.Allocator:          { vma.destroy_allocator(res)                            }
-        case Image_With_Allocator:   { image_destroy(&res.image, self.device, res.allocator) }
-        case: {
-            assert(false, "Unknown resource type in deletion queue")
-        }
+        case proc "c" ():            { res()                                                }
+        case vk.Pipeline:            { vk.DestroyPipeline(self.device, res, nil)            }
+        case vk.PipelineLayout:      { vk.DestroyPipelineLayout(self.device, res, nil)      }
+        case vk.DescriptorSetLayout: { vk.DestroyDescriptorSetLayout(self.device, res, nil) }
+        case vk.DescriptorPool:      { vk.DestroyDescriptorPool(self.device, res, nil)      }
+        case vk.ImageView:           { vk.DestroyImageView(self.device, res, nil)           }
+        case vk.Sampler:             { vk.DestroySampler(self.device, res, nil)             }
+        case vk.CommandPool:         { vk.DestroyCommandPool(self.device, res, nil)         }
+        case vk.Fence:               { vk.DestroyFence(self.device, res, nil)               }
+        case vk.Semaphore:           { vk.DestroySemaphore(self.device, res, nil)           }
+        case vk.Buffer:              { vk.DestroyBuffer(self.device, res, nil)              }
+        case vk.DeviceMemory:        { vk.FreeMemory(self.device, res, nil)                 }
+        case vma.Allocator:          { vma.destroy_allocator(res)                           }
+        case Allocated_Image:        { image_destroy(&res, engine.device, engine.allocator) }
+        case Allocated_Buffer:       { destroy_buffer(engine.allocator, &res)               }
+        case Mesh_Asset:             { destroy_mesh_asset(engine, &res)                     }
+        case: assert(false, "Unknown resource type in deletion queue")
         }
     }
 }
@@ -1057,3 +1319,96 @@ Compute_Push_Constants :: struct {
     data4: Vec4,
 }
 
+engine_upload_mesh :: proc(self: ^Engine, indices: []u32, vertices: []Vertex) -> (mesh_buff: Gpu_Mesh_Buffers, ok: bool) {
+    vb_size := len(vertices) * size_of(Vertex)
+    ib_size := len(indices) * size_of(u32)
+
+    new_surface: Gpu_Mesh_Buffers
+    new_surface.vertex_buffer, ok = create_buffer(
+        self,
+        u64(vb_size),
+        { .STORAGE_BUFFER, .TRANSFER_DST, .SHADER_DEVICE_ADDRESS },
+        .GPU_ONLY,
+    )
+    defer if !ok {
+        destroy_buffer(self.allocator, &new_surface.vertex_buffer)
+    }
+
+    if !ok {
+        log.error("")
+        return
+    }
+
+    // Find the address of the vertex buffer
+    device_addr_info := vk.BufferDeviceAddressInfo{
+        sType = .BUFFER_DEVICE_ADDRESS_INFO,
+        buffer = new_surface.vertex_buffer.buffer,
+    }
+    new_surface.vertex_buffer_address = vk.GetBufferDeviceAddress(self.device, &device_addr_info)
+
+    // Create the index buffer
+    new_surface.index_buffer, ok = create_buffer(
+        self,
+        u64(ib_size),
+        { .INDEX_BUFFER, .TRANSFER_DST },
+        .GPU_ONLY,
+    )
+    defer if !ok {
+        destroy_buffer(self.allocator, &new_surface.index_buffer)
+    }
+
+    // Upload the data to the buffer
+    staging_buffer: Allocated_Buffer
+    staging_buffer, ok = create_buffer(
+        self,
+        u64(vb_size + ib_size),
+        { .TRANSFER_SRC, },
+        .CPU_ONLY,
+    )
+    defer destroy_buffer(self.allocator, &staging_buffer)
+
+    Copy_Info :: struct {
+        staging_buffer: vk.Buffer,
+        vertex_buffer: vk.Buffer,
+        index_buffer:  vk.Buffer,
+        vertex_buffer_size: vk.DeviceSize,
+        index_buffer_size: vk.DeviceSize,
+    }
+
+    copy_info := Copy_Info{
+        staging_buffer = staging_buffer.buffer,
+        vertex_buffer = new_surface.vertex_buffer.buffer,
+        index_buffer = new_surface.index_buffer.buffer,
+        vertex_buffer_size = vk.DeviceSize(vb_size),
+        index_buffer_size = vk.DeviceSize(ib_size),
+    }
+
+    intr.mem_copy(staging_buffer.info.mapped_data, raw_data(vertices), vb_size)
+    intr.mem_copy(
+        rawptr(uintptr(staging_buffer.info.mapped_data) + uintptr(vb_size)),
+        raw_data(indices),
+        ib_size,
+    )
+
+    _immediate_submit(
+        self,
+        &copy_info,
+        proc(_: ^Engine, cmd: vk.CommandBuffer, data: ^Copy_Info) {
+            vertex_copy := vk.BufferCopy{
+                srcOffset = 0,
+                dstOffset = 0,
+                size = data.vertex_buffer_size,
+            }
+            vk.CmdCopyBuffer(cmd, data.staging_buffer, data.vertex_buffer, 1, &vertex_copy)
+
+            index_copy := vk.BufferCopy{
+                srcOffset = data.vertex_buffer_size,
+                dstOffset = 0,
+                size = data.index_buffer_size,
+            }
+            vk.CmdCopyBuffer(cmd, data.staging_buffer, data.index_buffer, 1, &index_copy)
+        },
+    )
+
+    return new_surface, true
+}

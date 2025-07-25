@@ -33,6 +33,7 @@ Vec4i :: [4]i32
 Vec4u :: [4]u32
 Vec4f :: [4]f32
 Vec4  :: Vec4f
+Mat4  :: matrix[4, 4]f32
 
 vec_dot :: proc(a, b: [$N]$T) -> T where intr.type_is_numeric(T) {
     res := $T(0)

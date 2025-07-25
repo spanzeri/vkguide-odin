@@ -86,11 +86,11 @@ init_submit_info :: proc(
     return vk.SubmitInfo2{
         sType = .SUBMIT_INFO_2,
         pNext = nil,
-        waitSemaphoreInfoCount = 1,
+        waitSemaphoreInfoCount = 1 if wait_semaphore_info != nil else 0,
         pWaitSemaphoreInfos = wait_semaphore_info,
         commandBufferInfoCount = 1,
         pCommandBufferInfos = cmd_buffer_submit_info,
-        signalSemaphoreInfoCount = 1,
+        signalSemaphoreInfoCount = 1 if signal_semaphore_info != nil else 0,
         pSignalSemaphoreInfos = signal_semaphore_info,
     }
 }

@@ -5,7 +5,7 @@ import "core:os"
 import "core:mem"
 
 start :: proc() -> (ok: bool) {
-    engine := VulkanEngine{}
+    engine := Engine{}
 
     // !!Test code: BEGIN!!
     ui_context: Ui_Context

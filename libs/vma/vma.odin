@@ -99,6 +99,27 @@ Vulkan_Functions :: struct {
     get_memory_win32_handle_khr:                vk.ProcGetMemoryWin32HandleKHR,
 }
 
+Allocation_Info :: struct {
+    memory_type:   u32,
+    device_memory: vk.DeviceMemory,
+    offset:        vk.DeviceSize,
+    size:          vk.DeviceSize,
+    mapped_data:   rawptr,
+    user_data:     rawptr,
+    name:          cstring,
+}
+
+Allocation_Create_Info :: struct {
+    flags:              Allocation_Create_Flags,
+    usage:              Memory_Usage,
+    required_flags:     vk.MemoryPropertyFlags,
+    preferred_flags:    vk.MemoryPropertyFlags,
+    memory_type_bits:   u32,
+    pool:               Pool,
+    user_data:          rawptr,
+    priority:           f32,
+}
+
 create_vulkan_functions :: proc() -> Vulkan_Functions {
     return Vulkan_Functions{
         _unused_1                                  = nil,
@@ -131,58 +152,37 @@ create_vulkan_functions :: proc() -> Vulkan_Functions {
     }
 }
 
-Allocation_Create_Info :: struct {
-    flags:              Allocation_Create_Flags,
-    usage:              Memory_Usage,
-    required_flags:     vk.MemoryPropertyFlags,
-    preferred_flags:    vk.MemoryPropertyFlags,
-    memory_type_bits:   u32,
-    pool:               Pool,
-    user_data:          rawptr,
-    priority:           f32,
-}
-
 Allocation_Create_Flags :: distinct bit_set[Allocation_Create_Flag; Flags]
 Allocation_Create_Flag :: enum Flags {
-    DedicatedMemory                = 0,
-    NeverAllocate                  = 1,
-    Mapped                         = 2,
-    UserDataCopyString             = 5,
-    UpperAddress                   = 6,
-    DontBind                       = 7,
-    WithinBudget                   = 8,
-    CanAlias                       = 9,
-    HostAccessSequentialWrite      = 10,
-    HostAccessRandom               = 11,
-    HostAccessAllowTransferInstead = 12,
-    StrategyMinMemory              = 16,
-    StrategyMinTime                = 17,
-    StrategyMinOffset              = 18,
-    StrategyBestFit                = StrategyMinMemory,
-    StrategyFirstFit               = StrategyMinTime,
+    DEDICATED_MEMORY                   = 0,
+    NEVER_ALLOCATE                     = 1,
+    MAPPED                             = 2,
+    USER_DATA_COPY_STRING              = 5,
+    UPPER_ADDRESS                      = 6,
+    DONT_BIND                          = 7,
+    WITHIN_BUDGET                      = 8,
+    CAN_ALIAS                          = 9,
+    HOST_ACCESS_SEQUENTIAL_WRITE       = 10,
+    HOST_ACCESS_RANDOM                 = 11,
+    HOST_ACCESS_ALLOW_TRANSFER_INSTEAD = 12,
+    STRATEGY_MIN_MEMORY                = 16,
+    STRATEGY_MIN_TIME                  = 17,
+    STRATEGY_MIN_OFFSET                = 18,
+    STRATEGY_BEST_FIT                  = STRATEGY_MIN_MEMORY,
+    STRATEGY_FIRST_FIT                 = STRATEGY_MIN_TIME,
 }
 
 Memory_Usage :: enum u32 {
-    Unknown            = 0,
-    GPUOnly            = 1,
-    CPUOnly            = 2,
-    CPUToGPU           = 3,
-    GPUToCPU           = 4,
-    CPUCopy            = 5,
-    GPULazilyAllocated = 6,
-    Auto               = 7,
-    AutoPreferDevice   = 8,
-    AutoPreferHost     = 9,
-}
-
-Allocation_Info :: struct {
-    memory_type:   u32,
-    device_memory: vk.DeviceMemory,
-    offset:        vk.DeviceSize,
-    size:          vk.DeviceSize,
-    mapped_data:   rawptr,
-    user_data:     rawptr,
-    name:          cstring,
+    UNKNOWN              = 0,
+    GPU_ONLY             = 1,
+    CPU_ONLY             = 2,
+    CPU_TO_GPU           = 3,
+    GPU_TO_CPU           = 4,
+    CPU_COPY             = 5,
+    GPU_LAZILY_ALLOCATED = 6,
+    AUTO                 = 7,
+    AUTO_PREFER_DEVICE   = 8,
+    AUTO_PREFER_HOST     = 9,
 }
 
 @(default_calling_convention="c")
@@ -210,6 +210,23 @@ foreign _vma_lib_ {
     destroy_image :: proc(
         allocator: Allocator,
         image: vk.Image,
+        allocation: Allocation,
+    ) -> vk.Result ---
+
+    @(link_name="vmaCreateBuffer")
+    create_buffer :: proc(
+        allocator: Allocator,
+        #by_ptr buffer_create_info: vk.BufferCreateInfo,
+        #by_ptr allocation_create_info: Allocation_Create_Info,
+        buffer: ^vk.Buffer,
+        allocation: ^Allocation,
+        allocation_info: ^Allocation_Info,
+    ) -> vk.Result ---
+
+    @(link_name="vmaDestroyBuffer")
+    destroy_buffer :: proc(
+        allocator: Allocator,
+        buffer: vk.Buffer,
         allocation: Allocation,
     ) -> vk.Result ---
 }
