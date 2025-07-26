@@ -59,6 +59,7 @@ Engine :: struct {
     swapchain_extent:                   vk.Extent2D,
 
     draw_image:                         Allocated_Image,
+    depth_image:                        Allocated_Image,
     draw_image_extent:                  vk.Extent2D,
 
     global_descriptor_allocator:        vk.DescriptorPool,
@@ -364,6 +365,7 @@ engine_draw :: proc(self: ^Engine) -> (ok: bool) {
 
     // Transition into color attachment optimal for normal rendering
     image_transition(cmd, self.draw_image.image, .GENERAL, .COLOR_ATTACHMENT_OPTIMAL)
+    image_transition(cmd, self.depth_image.image, .UNDEFINED, .DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
     _draw_geometry(self, cmd)
 
     // Transition the image into something that can be presented
@@ -453,7 +455,8 @@ _draw_background :: proc(self: ^Engine, cmd: vk.CommandBuffer) {
 _draw_geometry :: proc(self: ^Engine, cmd: vk.CommandBuffer) {
     // Dynamic rendering setup
     color_attachment := init_rendering_attachment_info(self.draw_image.view, nil)
-    render_info := init_rendering_info(self.draw_image_extent, &color_attachment, nil)
+    depth_attachment := init_depth_attachment_info(self.depth_image.view)
+    render_info := init_rendering_info(self.draw_image_extent, &color_attachment, &depth_attachment)
 
     vk.CmdBeginRendering(cmd, &render_info)
     defer vk.CmdEndRendering(cmd)
@@ -495,12 +498,11 @@ _draw_geometry :: proc(self: ^Engine, cmd: vk.CommandBuffer) {
     vk.CmdDrawIndexed(cmd, 6, 1, 0, 0, 0)
 
     view := la.matrix4_translate_f32({ 0, 0, -5 })
-    proj := la.matrix4_perspective_f32(
+    proj := matrix4_infinite_perspective_reverse_z_f32(
         math.to_radians_f32(70.0),
         f32(self.draw_image_extent.width) / f32(self.draw_image_extent.height),
         0.1,
-        100.0)
-
+    )
 
     // Draw meshes
     for mesh, mi in self.meshes {
@@ -715,12 +717,10 @@ _init_swapchain :: proc(self: ^Engine) -> (ok: bool) {
         draw_image_usage_flags,
         draw_image_extent,
     )
-
     alloc_info := vma.Allocation_Create_Info{
         usage          = .GPU_ONLY,
         required_flags = { .DEVICE_LOCAL },
     }
-
     vk_check(
         vma.create_image(
             self.allocator,
@@ -740,10 +740,41 @@ _init_swapchain :: proc(self: ^Engine) -> (ok: bool) {
         self.draw_image.image,
         { .COLOR },
     )
-
     vk_check(vk.CreateImageView(self.device, &image_view_create_info, nil, &self.draw_image.view)) or_return
 
     deletion_queue_push(&self.deletion_queue, self.draw_image)
+
+    self.depth_image.format = .D32_SFLOAT
+    self.depth_image.extent = draw_image_extent
+
+    depth_image_create_info := init_image_create_info(
+        self.depth_image.format,
+        { .DEPTH_STENCIL_ATTACHMENT },
+        self.depth_image.extent,
+    )
+    depth_alloc_info := vma.Allocation_Create_Info{
+        usage          = .GPU_ONLY,
+        required_flags = { .DEVICE_LOCAL },
+    }
+    vk_check(
+        vma.create_image(
+            self.allocator,
+            depth_image_create_info,
+            depth_alloc_info,
+            &self.depth_image.image,
+            &self.depth_image.allocation,
+            nil,
+        ),
+    ) or_return
+
+    depth_image_view_create_info := init_image_view_create_info(
+        self.depth_image.format,
+        self.depth_image.image,
+        { .DEPTH },
+    )
+    vk_check(vk.CreateImageView(self.device, &depth_image_view_create_info, nil, &self.depth_image.view)) or_return
+
+    deletion_queue_push(&self.deletion_queue, self.depth_image)
 
     return true
 }
@@ -1090,10 +1121,9 @@ _init_background_pipelines :: proc(self: ^Engine) -> (ok: bool) {
         pipeline_builder_set_cull_mode(&pipeline_builder,  { .BACK })
         pipeline_builder_disable_multisampling(&pipeline_builder)
         pipeline_builder_disable_blending(&pipeline_builder)
-        pipeline_builder_disable_depth_test(&pipeline_builder)
-
         pipeline_builder_set_color_attachment_format(&pipeline_builder, self.draw_image.format)
-        pipeline_builder_set_depth_format(&pipeline_builder, .UNDEFINED)
+        pipeline_builder_enable_depth_test(&pipeline_builder, true, .GREATER_OR_EQUAL)
+        pipeline_builder_set_depth_format(&pipeline_builder, self.depth_image.format)
 
         self.triangle_pipeline, ok = pipeline_builder_build(&pipeline_builder, self.device)
         if !ok {
@@ -1172,10 +1202,10 @@ _init_background_pipelines :: proc(self: ^Engine) -> (ok: bool) {
 @(private="file")
 _init_default_data :: proc(self: ^Engine) -> (ok: bool) {
     rect_vertices := [?]Vertex{
-        { position = Vec3{ 0.5, -0.5, 0.0}, uv_x = 0.0, color = Vec4{ 0.0, 0.0, 0.0, 1 }, uv_y = 0.0 },
-        { position = Vec3{ 0.5,  0.5, 0.0}, uv_x = 0.0, color = Vec4{ 0.5, 0.5, 0.5, 1 }, uv_y = 0.0 },
-        { position = Vec3{-0.5, -0.5, 0.0}, uv_x = 0.0, color = Vec4{ 1.0, 0.0, 0.0, 1 }, uv_y = 0.0 },
-        { position = Vec3{-0.5,  0.5, 0.0}, uv_x = 0.0, color = Vec4{ 0.0, 1.0, 0.0, 1 }, uv_y = 0.0 },
+        { position = Vec3{ 0.5, -0.5, 0.01}, uv_x = 0.0, color = Vec4{ 0.0, 0.0, 0.0, 1 }, uv_y = 0.0 },
+        { position = Vec3{ 0.5,  0.5, 0.01}, uv_x = 0.0, color = Vec4{ 0.5, 0.5, 0.5, 1 }, uv_y = 0.0 },
+        { position = Vec3{-0.5, -0.5, 0.01}, uv_x = 0.0, color = Vec4{ 1.0, 0.0, 0.0, 1 }, uv_y = 0.0 },
+        { position = Vec3{-0.5,  0.5, 0.01}, uv_x = 0.0, color = Vec4{ 0.0, 1.0, 0.0, 1 }, uv_y = 0.0 },
     }
 
     rect_indices := [?]u32{

@@ -159,6 +159,25 @@ init_rendering_attachment_info :: proc(
     return info
 }
 
+init_depth_attachment_info :: proc(
+    view: vk.ImageView,
+    layout := vk.ImageLayout.DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+) -> vk.RenderingAttachmentInfo {
+    info := vk.RenderingAttachmentInfo{
+        sType       = .RENDERING_ATTACHMENT_INFO,
+        pNext       = nil,
+        imageView   = view,
+        imageLayout = layout,
+        loadOp      = .CLEAR,
+        storeOp     = .STORE,
+        clearValue = {
+            depthStencil = { depth = 0.0 },
+        },
+    }
+
+    return info
+}
+
 init_rendering_info :: proc(
     extent: vk.Extent2D,
     color_attachment: ^vk.RenderingAttachmentInfo,

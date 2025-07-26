@@ -3,6 +3,7 @@ package vkguide
 import "base:runtime"
 import intr "base:intrinsics"
 import "core:log"
+import "core:math"
 
 import vk "vendor:vulkan"
 
@@ -41,5 +42,18 @@ vec_dot :: proc(a, b: [$N]$T) -> T where intr.type_is_numeric(T) {
         res = a[i] * b[i]
     }
     return res
+}
+
+@(require_results)
+matrix4_infinite_perspective_reverse_z_f32 :: proc "contextless" (
+    fovy, aspect, near: f32,
+) -> (m: Mat4) #no_bounds_check {
+    f := 1.0 / math.tan(fovy * 0.5)
+    m[0, 0] =  f / aspect
+    m[1, 1] =  f
+    m[3, 2] = -1.0
+    m[2, 3] = near
+
+    return
 }
 

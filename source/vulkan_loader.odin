@@ -146,6 +146,8 @@ loader_load_gltf_meshes :: proc(
                     }
                 }
             }
+
+            // Load normals
             if normal_index != -1 {
                 normal_attribute := primitive.attributes[normal_index]
                 assert(normal_attribute.data.type == .vec3)
@@ -164,6 +166,38 @@ loader_load_gltf_meshes :: proc(
                         components[vi * 3 + 2],
                     }
                     vertices[initial_vertex + vi].normal = la.normalize(nml)
+                }
+            } else {
+                // Manually calculate normals if not provided
+                for i := first_index; i < len(indices); i += 3 {
+                    v0 := vertices[initial_vertex + int(indices[i + 0])]
+                    v1 := vertices[initial_vertex + int(indices[i + 1])]
+                    v2 := vertices[initial_vertex + int(indices[i + 2])]
+
+                    edge1 := v1.position - v0.position
+                    edge2 := v2.position - v0.position
+                    normal := la.normalize(la.cross(edge1, edge2))
+
+                    vertices[initial_vertex + int(indices[i + 0])].normal += normal
+                    vertices[initial_vertex + int(indices[i + 1])].normal += normal
+                    vertices[initial_vertex + int(indices[i + 2])].normal += normal
+                }
+            }
+
+            // Load UVs
+            if uv_index != -1 || primitive.attributes[uv_index].data.type == .vec2 {
+                uv_attribute := primitive.attributes[uv_index]
+                assert(uv_attribute.data.count == vertex_count)
+
+                _ = cgltf.accessor_unpack_floats(
+                    uv_attribute.data,
+                    &components[0],
+                    uv_attribute.data.count * 2,
+                )
+
+                for vi in 0 ..< int(vertex_count) {
+                    vertices[initial_vertex + vi].uv_x = components[vi * 2 + 0]
+                    vertices[initial_vertex + vi].uv_y = components[vi * 2 + 1]
                 }
             }
 

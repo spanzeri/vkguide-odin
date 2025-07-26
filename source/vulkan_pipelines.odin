@@ -179,6 +179,22 @@ pipeline_builder_disable_depth_test :: proc(self: ^Pipeline_Builder) {
     self.depth_stencil.maxDepthBounds        = 1.0
 }
 
+pipeline_builder_enable_depth_test :: proc(
+    self: ^Pipeline_Builder,
+    write_enabled: bool,
+    compare_op: vk.CompareOp = .LESS,
+) {
+    self.depth_stencil.depthTestEnable       = true
+    self.depth_stencil.depthWriteEnable      = b32(write_enabled)
+    self.depth_stencil.depthCompareOp        = compare_op
+    self.depth_stencil.stencilTestEnable     = false
+    self.depth_stencil.depthBoundsTestEnable = false
+    self.depth_stencil.front                 = {}
+    self.depth_stencil.back                  = {}
+    self.depth_stencil.minDepthBounds        = 0.0
+    self.depth_stencil.maxDepthBounds        = 1.0
+}
+
 //
 // Tests
 //
