@@ -16,16 +16,16 @@ image_transition :: proc(cmd: vk.CommandBuffer, image: vk.Image, current_layout,
         (new_layout == .DEPTH_STENCIL_ATTACHMENT_OPTIMAL || current_layout == .DEPTH_ATTACHMENT_OPTIMAL)
 
     image_barrier := vk.ImageMemoryBarrier2{
-        sType = .IMAGE_MEMORY_BARRIER_2,
-        pNext = nil,
-        srcStageMask = { .ALL_COMMANDS },
-        srcAccessMask = { .MEMORY_WRITE },
-        dstStageMask = { .ALL_COMMANDS },
-        dstAccessMask = { .MEMORY_READ, .MEMORY_WRITE },
-        oldLayout = current_layout,
-        newLayout = new_layout,
+        sType            = .IMAGE_MEMORY_BARRIER_2,
+        pNext            = nil,
+        srcStageMask     = { .ALL_COMMANDS },
+        srcAccessMask    = { .MEMORY_WRITE },
+        dstStageMask     = { .ALL_COMMANDS },
+        dstAccessMask    = { .MEMORY_READ, .MEMORY_WRITE },
+        oldLayout        = current_layout,
+        newLayout        = new_layout,
         subresourceRange = init_subresource_range({ .DEPTH } if is_depth else { .COLOR }),
-        image = image,
+        image            = image,
     }
 
     dependency_info := vk.DependencyInfo{
@@ -67,16 +67,16 @@ copy_image_to_image :: proc(
             { i32(src_extent.width), i32(src_extent.height), 1 },
         },
         srcSubresource = {
-            aspectMask = { .COLOR },
+            aspectMask     = { .COLOR },
             baseArrayLayer = 0,
-            layerCount = 1,
-            mipLevel = 0,
+            layerCount     = 1,
+            mipLevel       = 0,
         },
         dstSubresource = {
-            aspectMask = { .COLOR },
+            aspectMask     = { .COLOR },
             baseArrayLayer = 0,
-            layerCount = 1,
-            mipLevel = 0,
+            layerCount     = 1,
+            mipLevel       = 0,
         },
     }
 

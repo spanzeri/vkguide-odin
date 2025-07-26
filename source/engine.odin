@@ -21,73 +21,77 @@ when ODIN_OS == .Linux {
 }
 
 Engine :: struct {
-    window:                             ^sdl.Window,
-    minimized:                          bool,
+    window:                                 ^sdl.Window,
+    minimized:                              bool,
+    resize_required:                        bool,
 
-    window_extent:                      struct {
+    window_extent: struct {
         width:  u32,
         height: u32,
     },
 
-    instance:                           vk.Instance,
-    debug_messenger:                    vk.DebugUtilsMessengerEXT,
+    instance:                               vk.Instance,
+    debug_messenger:                        vk.DebugUtilsMessengerEXT,
 
-    surface:                            vk.SurfaceKHR,
-    physical_device:                    vk.PhysicalDevice,
+    surface:                                vk.SurfaceKHR,
+    physical_device:                        vk.PhysicalDevice,
 
-    physical_device_properties:         vk.PhysicalDeviceProperties,
-    physical_device_features:           vk.PhysicalDeviceFeatures,
-    physical_device_memory_properties:  vk.PhysicalDeviceMemoryProperties,
+    physical_device_properties:             vk.PhysicalDeviceProperties,
+    physical_device_features:               vk.PhysicalDeviceFeatures,
+    physical_device_memory_properties:      vk.PhysicalDeviceMemoryProperties,
 
-    device:                             vk.Device,
+    device:                                 vk.Device,
 
-    allocator:                          vma.Allocator,
+    allocator:                              vma.Allocator,
 
-    graphics_queue_family_index:        u32,
-    present_queue_family_index:         u32,
-    compute_queue_family_index:         u32,
-    transfer_queue_family_index:        u32,
-    graphics_queue:                     vk.Queue,
-    present_queue:                      vk.Queue,
-    compute_queue:                      vk.Queue,
-    transfer_queue:                     vk.Queue,
+    graphics_queue_family_index:            u32,
+    present_queue_family_index:             u32,
+    compute_queue_family_index:             u32,
+    transfer_queue_family_index:            u32,
+    graphics_queue:                         vk.Queue,
+    present_queue:                          vk.Queue,
+    compute_queue:                          vk.Queue,
+    transfer_queue:                         vk.Queue,
 
-    swapchain:                          vk.SwapchainKHR,
-    swapchain_images:                   [dynamic]vk.Image,
-    swapchain_image_views:              [dynamic]vk.ImageView,
-    swapchain_present_semaphores:       [dynamic]vk.Semaphore,
-    swapchain_extent:                   vk.Extent2D,
+    swapchain:                              vk.SwapchainKHR,
+    swapchain_images:                       [dynamic]vk.Image,
+    swapchain_image_views:                  [dynamic]vk.ImageView,
+    swapchain_present_semaphores:           [dynamic]vk.Semaphore,
+    swapchain_extent:                       vk.Extent2D,
 
-    draw_image:                         Allocated_Image,
-    depth_image:                        Allocated_Image,
-    draw_image_extent:                  vk.Extent2D,
+    draw_image:                             Allocated_Image,
+    depth_image:                            Allocated_Image,
+    draw_image_extent:                      vk.Extent2D,
 
-    global_descriptor_allocator:        vk.DescriptorPool,
+    global_descriptor_allocator:            vk.DescriptorPool,
 
-    draw_image_descriptor_set:          vk.DescriptorSet,
-    draw_image_descriptor_set_layout:   vk.DescriptorSetLayout,
+    draw_image_descriptor_set:              vk.DescriptorSet,
+    draw_image_descriptor_set_layout:       vk.DescriptorSetLayout,
 
-    gradient_pipeline:                  vk.Pipeline,
-    gradient_pipeline_layout:           vk.PipelineLayout,
+    gpu_scene_data:                         Gpu_Scene_Data,
+    gpu_scene_data_descriptor_set_layout:   vk.DescriptorSetLayout,
 
-    triangle_pipeline:                  vk.Pipeline,
-    triangle_pipeline_layout:           vk.PipelineLayout,
+    gradient_pipeline:                      vk.Pipeline,
+    gradient_pipeline_layout:               vk.PipelineLayout,
 
-    mesh_pipeline:                      vk.Pipeline,
-    mesh_pipeline_layout:               vk.PipelineLayout,
+    triangle_pipeline:                      vk.Pipeline,
+    triangle_pipeline_layout:               vk.PipelineLayout,
 
-    rectangle:                          Gpu_Mesh_Buffers,
-    meshes:                             [dynamic]Mesh_Asset,
+    mesh_pipeline:                          vk.Pipeline,
+    mesh_pipeline_layout:                   vk.PipelineLayout,
+
+    rectangle:                              Gpu_Mesh_Buffers,
+    meshes:                                 [dynamic]Mesh_Asset,
 
     // Immediate submit structures
-    immediate_fence:                    vk.Fence,
-    immediate_command_pool:             vk.CommandPool,
-    immediate_command_buffer:           vk.CommandBuffer,
+    immediate_fence:                        vk.Fence,
+    immediate_command_pool:                 vk.CommandPool,
+    immediate_command_buffer:               vk.CommandBuffer,
 
-    frames:                             [INFLIGHT_FRAME_OVERLAP]Frame_Data,
-    frame_number:                       u64,
+    frames:                                 [INFLIGHT_FRAME_OVERLAP]Frame_Data,
+    frame_number:                           u64,
 
-    deletion_queue:                     Deletion_Queue,
+    deletion_queue:                         Deletion_Queue,
 }
 
 Engine_Init_Options :: struct {
@@ -101,6 +105,7 @@ Frame_Data :: struct {
     swapchain_semaphore:        vk.Semaphore,
     render_fence:               vk.Fence,
     deletion_queue:             Deletion_Queue,
+    frame_descriptors:          Descriptor_Growable_Allocator,
 }
 
 Allocated_Buffer :: struct {
@@ -128,6 +133,15 @@ Gpu_Draw_Push_Constants :: struct {
     vertex_buffer:  vk.DeviceAddress,
 }
 
+Gpu_Scene_Data :: struct {
+    view:               Mat4,
+    projection:         Mat4,
+    viewproj:           Mat4,
+    ambient_color:      Vec4,
+    sunlight_direction: Vec4, // w for intensity
+    sunlight_color:     Vec4,
+}
+
 INFLIGHT_FRAME_OVERLAP :: 2
 
 @(require_results)
@@ -150,7 +164,8 @@ engine_init :: proc(
         return false
     }
 
-    self.window = sdl.CreateWindow("Vulkan Engine", opts.window_size.x, opts.window_size.y, sdl.WINDOW_VULKAN)
+    window_flags := sdl.WindowFlags{ .RESIZABLE, .HIGH_PIXEL_DENSITY, .VULKAN }
+    self.window = sdl.CreateWindow("Vulkan Engine", opts.window_size.x, opts.window_size.y, window_flags)
     if self.window == nil {
         log.error("Failed to create SDL window: %s", sdl.GetError())
         return false
@@ -211,27 +226,28 @@ engine_shutdown :: proc(self: ^Engine) {
 
     _destroy_swapchain(self)
 
-    for i in 0 ..< INFLIGHT_FRAME_OVERLAP {
-        if self.frames[i].render_fence != 0 {
-            vk.WaitForFences(self.device, 1, &self.frames[i].render_fence, true, u64(1e9))
-            vk.DestroyFence(self.device, self.frames[i].render_fence, nil)
-            self.frames[i].render_fence = 0
+    for &frame in self.frames {
+        if frame.render_fence != 0 {
+            vk.WaitForFences(self.device, 1, &frame.render_fence, true, u64(1e9))
+            vk.DestroyFence(self.device, frame.render_fence, nil)
+            frame.render_fence = 0
         }
-        if self.frames[i].swapchain_semaphore != 0 {
-            vk.DestroySemaphore(self.device, self.frames[i].swapchain_semaphore, nil)
-            self.frames[i].swapchain_semaphore = 0
-        }
-
-        if self.frames[i].main_command_buffer != nil {
-            vk.FreeCommandBuffers(self.device, self.frames[i].command_pool, 1, &self.frames[i].main_command_buffer)
-            self.frames[i].main_command_buffer = nil
-        }
-        if self.frames[i].command_pool != 0 {
-            vk.DestroyCommandPool(self.device, self.frames[i].command_pool, nil)
-            self.frames[i].command_pool = 0
+        if frame.swapchain_semaphore != 0 {
+            vk.DestroySemaphore(self.device, frame.swapchain_semaphore, nil)
+            frame.swapchain_semaphore = 0
         }
 
-        deletion_queue_destroy(&self.frames[i].deletion_queue, self)
+        if frame.main_command_buffer != nil {
+            vk.FreeCommandBuffers(self.device, frame.command_pool, 1, &frame.main_command_buffer)
+            frame.main_command_buffer = nil
+        }
+        if frame.command_pool != 0 {
+            vk.DestroyCommandPool(self.device, frame.command_pool, nil)
+            frame.command_pool = 0
+        }
+
+        deletion_queue_destroy(&frame.deletion_queue, self)
+        descriptor_growable_allocator_destroy(&frame.frame_descriptors)
     }
 
     deletion_queue_destroy(&self.deletion_queue, self)
@@ -277,6 +293,13 @@ engine_run :: proc(self: ^Engine) {
                 self.minimized = true
             case .WINDOW_RESTORED:
                 self.minimized = false
+            }
+        }
+
+        if self.resize_required {
+            if !_resize_swapchain(self) {
+                log.error("Failed to resize swapchain")
+                return
             }
         }
 
@@ -333,19 +356,29 @@ engine_draw :: proc(self: ^Engine) -> (ok: bool) {
     one_sec := u64(1e9)
     vk_check(vk.WaitForFences(self.device, 1, &frame.render_fence, true, one_sec)) or_return
 
+    // Cleanup queue and descriptors for this frame
     deletion_queue_flush(&frame.deletion_queue, self)
+    descriptor_growable_allocator_clear_pools(&frame.frame_descriptors)
 
     vk_check(vk.ResetFences(self.device, 1, &frame.render_fence)) or_return
 
     image_index: u32
-    vk_check(vk.AcquireNextImageKHR(
+    result := vk.AcquireNextImageKHR(
         self.device,
         self.swapchain,
         one_sec,
         frame.swapchain_semaphore,
         0,
         &image_index,
-    )) or_return
+    )
+    if result == .ERROR_OUT_OF_DATE_KHR {
+        self.resize_required = true
+        return true
+    }
+    if result != .SUCCESS {
+        log.error("Failed to acquire next image: %v", result)
+        return false
+    }
 
     // Reset command buffer
     cmd := frame.main_command_buffer
@@ -406,7 +439,13 @@ engine_draw :: proc(self: ^Engine) -> (ok: bool) {
         waitSemaphoreCount = 1,
         pImageIndices =      &image_index,
     }
-    vk_check(vk.QueuePresentKHR(self.present_queue, &present_info)) or_return
+    result = vk.QueuePresentKHR(self.present_queue, &present_info)
+    if result == .ERROR_OUT_OF_DATE_KHR || result == .SUBOPTIMAL_KHR {
+        self.resize_required = true
+    } else if result != .SUCCESS {
+        log.error("Failed to present image: %v", result)
+        return false
+    }
 
     // Increment the frame number
     self.frame_number += 1
@@ -461,6 +500,37 @@ _draw_geometry :: proc(self: ^Engine, cmd: vk.CommandBuffer) {
     vk.CmdBeginRendering(cmd, &render_info)
     defer vk.CmdEndRendering(cmd)
 
+    // GPU scene data (buffer is allocated per-frame, as per the tutorial, but
+    // it would be better to be cached)
+    frame := _get_current_frame(self)
+
+    gpu_scene_data_buffer, ok := create_buffer(self, size_of(Gpu_Scene_Data), { .UNIFORM_BUFFER }, .CPU_TO_GPU)
+    assert(ok)
+    deletion_queue_push(&frame.deletion_queue, gpu_scene_data_buffer)
+    gpu_scene_data := cast(^Gpu_Scene_Data)(gpu_scene_data_buffer.info.mapped_data)
+    gpu_scene_data^ = self.gpu_scene_data
+
+    global_descriptor_set := descriptor_growable_allocator_allocate(
+        &frame.frame_descriptors,
+        self.gpu_scene_data_descriptor_set_layout,
+    )
+
+    writer := Descriptor_Writer{}
+    descriptor_writer_write_buffer(
+        &writer,
+        0,
+        gpu_scene_data_buffer.buffer,
+        size_of(Gpu_Scene_Data),
+        0,
+        .UNIFORM_BUFFER,
+    )
+    descriptor_writer_update_set(
+        &writer,
+        self.device,
+        global_descriptor_set,
+    )
+
+    // Set up viewport and scissor
     viewport := vk.Viewport{
         x        = 0.0,
         y        = f32(self.draw_image_extent.height),
@@ -505,8 +575,7 @@ _draw_geometry :: proc(self: ^Engine, cmd: vk.CommandBuffer) {
     )
 
     // Draw meshes
-    for mesh, mi in self.meshes {
-        if mi != 2 { continue }
+    for mesh in self.meshes {
         vk.CmdPushConstants(
             cmd,
             self.mesh_pipeline_layout,
@@ -827,6 +896,24 @@ _create_swapchain :: proc(self: ^Engine, width, height: u32) -> (ok: bool) {
 }
 
 @(private="file")
+_resize_swapchain :: proc(self: ^Engine) -> (ok: bool) {
+    vk.DeviceWaitIdle(self.device)
+    _destroy_swapchain(self)
+    w, h: i32
+    sdl.GetWindowSizeInPixels(self.window, &w, &h)
+    self.window_extent.width  = u32(w)
+    self.window_extent.height = u32(h)
+    self.resize_required = false
+
+    // image_destroy(&self.depth_image, self.device, self.allocator)
+    // image_destroy(&self.draw_image, self.device, self.allocator)
+
+    _create_swapchain(self, self.window_extent.width, self.window_extent.height) or_return
+
+    return true
+}
+
+@(private="file")
 _destroy_swapchain :: proc(self: ^Engine) {
     for swapchain_present_semaphore in self.swapchain_present_semaphores {
         vk.DestroySemaphore(self.device, swapchain_present_semaphore, nil)
@@ -966,21 +1053,38 @@ _init_descriptors :: proc(self: ^Engine) -> (ok: bool) {
             return false
         }
 
-        image_info := vk.DescriptorImageInfo{
-            imageLayout = .GENERAL,
-            imageView = self.draw_image.view,
-        }
+        writer := Descriptor_Writer{}
+        descriptor_writer_write_image(&writer, 0, self.draw_image.view, 0, .GENERAL, .STORAGE_IMAGE)
+        descriptor_writer_update_set(&writer, self.device, self.draw_image_descriptor_set)
+    }
 
-        draw_image_write := vk.WriteDescriptorSet{
-            sType = .WRITE_DESCRIPTOR_SET,
-            dstBinding = 0,
-            dstSet = self.draw_image_descriptor_set,
-            descriptorCount = 1,
-            descriptorType = .STORAGE_IMAGE,
-            pImageInfo = &image_info,
+    for &frame in self.frames {
+        frame.frame_descriptors, ok = descriptor_growable_allocator_init(
+            self.device,
+            1000,
+            []Pool_Size_Ratio{
+                { type = .STORAGE_BUFFER,           ratio = 3.0 },
+                { type = .STORAGE_IMAGE,            ratio = 3.0 },
+                { type = .UNIFORM_BUFFER,           ratio = 3.0 },
+                { type = .COMBINED_IMAGE_SAMPLER,   ratio = 4.0 },
+            },
+        )
+        if !ok {
+            log.error("Failed to create frame descriptor allocator")
+            return false
         }
+    }
 
-        vk.UpdateDescriptorSets(self.device, 1, &draw_image_write, 0, nil)
+    // Gpu scene data
+    {
+        builder := descriptor_layout_builder_init()
+        descriptor_layout_builder_add_binding(&builder, 0, .UNIFORM_BUFFER)
+        self.gpu_scene_data_descriptor_set_layout = descriptor_layout_builder_build(
+            &builder,
+            self.device,
+                { .VERTEX, .FRAGMENT },
+            )
+        deletion_queue_push(&self.deletion_queue, self.gpu_scene_data_descriptor_set_layout)
     }
 
     return true
@@ -1181,6 +1285,7 @@ _init_background_pipelines :: proc(self: ^Engine) -> (ok: bool) {
             { stage = .VERTEX,   module = vertex_shader_mod, },
             { stage = .FRAGMENT, module = fragment_shader_mod, },
         })
+        pipeline_builder_enable_blending_additive(&pipeline_builder)
         pipeline_builder.pipeline_layout = self.mesh_pipeline_layout
 
         self.mesh_pipeline, ok = pipeline_builder_build(
