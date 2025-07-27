@@ -38,17 +38,6 @@ image_transition :: proc(cmd: vk.CommandBuffer, image: vk.Image, current_layout,
     vk.CmdPipelineBarrier2(cmd, &dependency_info)
 }
 
-image_destroy :: proc(
-    allocated_image: ^Allocated_Image,
-    device: vk.Device,
-    allocator: vma.Allocator,
-) {
-    if allocated_image.view != 0 {
-        vk.DestroyImageView(device, allocated_image.view, nil)
-    }
-    vma.destroy_image(allocator, allocated_image.image, allocated_image.allocation)
-}
-
 copy_image_to_image :: proc(
     cmd: vk.CommandBuffer,
     src_image: vk.Image,
