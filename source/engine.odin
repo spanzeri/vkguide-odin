@@ -4,6 +4,7 @@ import intr "base:intrinsics"
 import "base:runtime"
 import "core:log"
 import "core:math"
+import "core:mem"
 import la "core:math/linalg"
 import "core:os"
 import "core:time"
@@ -61,12 +62,20 @@ Engine :: struct {
     gpu_scene_data:                     Gpu_Scene_Data,
     gpu_scene_data_descriptor_set_layout: vk.DescriptorSetLayout,
     single_image_descriptor_layout:     vk.DescriptorSetLayout,
+
     gradient_pipeline:                  vk.Pipeline,
     gradient_pipeline_layout:           vk.PipelineLayout,
     triangle_pipeline:                  vk.Pipeline,
     triangle_pipeline_layout:           vk.PipelineLayout,
     mesh_pipeline:                      vk.Pipeline,
     mesh_pipeline_layout:               vk.PipelineLayout,
+
+    ui_pipeline:                        vk.Pipeline,
+    ui_pipeline_layout:                 vk.PipelineLayout,
+    ui_vertex_buffer:                   Allocated_Buffer,
+    ui_index_buffer:                    Allocated_Buffer,
+    ui_vertex_buffer_address:           vk.DeviceAddress,
+
     rectangle:                          Gpu_Mesh_Buffers,
     meshes:                             [dynamic]Mesh_Asset,
 
@@ -114,6 +123,13 @@ Vertex :: struct {
     normal:   Vec3,
     uv_y:     f32,
     color:    Vec4,
+}
+
+Ui_Vertex :: struct {
+    position : Vec2,
+    uvs : Vec2,
+    color : Vec3,
+    flags : u32,
 }
 
 Gpu_Mesh_Buffers :: struct {
@@ -278,7 +294,7 @@ engine_shutdown :: proc(self: ^Engine) {
     sdl.Quit()
 }
 
-engine_run :: proc(self: ^Engine) {
+engine_run :: proc(self: ^Engine, ui: Ui_Context) {
     for {
         free_all(context.temp_allocator)
 
@@ -292,6 +308,8 @@ engine_run :: proc(self: ^Engine) {
             case .WINDOW_RESTORED:
                 self.minimized = false
             }
+
+            ui_update_input(ui, &event)
         }
 
         if self.resize_required {
@@ -304,9 +322,15 @@ engine_run :: proc(self: ^Engine) {
         if self.minimized {
             time.sleep(100 * time.Millisecond)
             continue
-        } else {
-            engine_draw(self)
         }
+
+        {
+            ui_begin(ui)
+            ui_demo(ui)
+            ui_end(ui)
+        }
+
+        engine_draw(self, ui)
     }
 }
 
@@ -398,13 +422,13 @@ engine_create_image :: proc(
 
 engine_create_image_with_data :: proc(
     self: ^Engine,
-    data: rawptr,
+    data: []u8,
     size: vk.Extent3D,
     format: vk.Format,
     usage: vk.ImageUsageFlags,
     mipmapped := false,
 ) -> (image: Allocated_Image, ok: bool) {
-    data_size := u64(size.width * size.height * size.depth * 4)
+    data_size := u64(len(data))
     upload_buffer, buf_ok := create_buffer(self, data_size, { .TRANSFER_SRC }, .CPU_TO_GPU)
     if !buf_ok {
         log.error("Failed to allocate buffer for image upload")
@@ -412,7 +436,7 @@ engine_create_image_with_data :: proc(
     }
     defer destroy_buffer(self.allocator, &upload_buffer)
 
-    intr.mem_copy(upload_buffer.info.mapped_data, data, data_size)
+    intr.mem_copy(upload_buffer.info.mapped_data, raw_data(data), data_size)
 
     image = engine_create_image(self, size, format, usage | { .TRANSFER_DST }, mipmapped) or_return
 
@@ -484,8 +508,8 @@ _is_depth_stencil_format :: proc(format: vk.Format) -> (depth: bool, stencil: bo
 }
 
 @(private = "file")
-engine_draw :: proc(self: ^Engine) -> (ok: bool) {
-    frame := _get_current_frame(self)
+engine_draw :: proc(self: ^Engine, ui: Ui_Context) -> (ok: bool) {
+    frame := engine_get_current_frame(self)
     one_sec := u64(1e9)
     vk_check(vk.WaitForFences(self.device, 1, &frame.render_fence, true, one_sec)) or_return
 
@@ -532,7 +556,29 @@ engine_draw :: proc(self: ^Engine) -> (ok: bool) {
     // Transition into color attachment optimal for normal rendering
     image_transition(cmd, self.draw_image.image, .GENERAL, .COLOR_ATTACHMENT_OPTIMAL)
     image_transition(cmd, self.depth_image.image, .UNDEFINED, .DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
-    _draw_geometry(self, cmd)
+
+    // Rendering
+    {
+        // Dynamic rendering setup
+        color_attachment := init_rendering_attachment_info(self.draw_image.view, nil)
+        depth_attachment := init_depth_attachment_info(self.depth_image.view)
+        render_info := init_rendering_info(
+            self.draw_image_extent,
+            &color_attachment,
+            &depth_attachment,
+        )
+
+        vk.CmdBeginRendering(cmd, &render_info)
+        defer vk.CmdEndRendering(cmd)
+
+        _draw_geometry(self, cmd)
+
+        // Draw UI
+        {
+            ui_draw_ctx := ui_render_context_init(self, cmd)
+            ui_render_context_render(ui, &ui_draw_ctx)
+        }
+    }
 
     // Transition the image into something that can be presented
     image_transition(cmd, self.draw_image.image, .COLOR_ATTACHMENT_OPTIMAL, .TRANSFER_SRC_OPTIMAL)
@@ -651,21 +697,9 @@ _draw_background :: proc(self: ^Engine, cmd: vk.CommandBuffer) {
 
 @(private = "file")
 _draw_geometry :: proc(self: ^Engine, cmd: vk.CommandBuffer) {
-    // Dynamic rendering setup
-    color_attachment := init_rendering_attachment_info(self.draw_image.view, nil)
-    depth_attachment := init_depth_attachment_info(self.depth_image.view)
-    render_info := init_rendering_info(
-        self.draw_image_extent,
-        &color_attachment,
-        &depth_attachment,
-    )
-
-    vk.CmdBeginRendering(cmd, &render_info)
-    defer vk.CmdEndRendering(cmd)
-
     // GPU scene data (buffer is allocated per-frame, as per the tutorial, but
     // it would be better to be cached)
-    frame := _get_current_frame(self)
+    frame := engine_get_current_frame(self)
 
     gpu_scene_data_buffer, ok := create_buffer(
         self,
@@ -1565,6 +1599,56 @@ _init_background_pipelines :: proc(self: ^Engine) -> (ok: bool) {
         deletion_queue_push(&self.deletion_queue, self.mesh_pipeline)
     }
 
+    // Create the UI pipeline
+    {
+        pipeline_layout_create_info := vk.PipelineLayoutCreateInfo {
+            sType = .PIPELINE_LAYOUT_CREATE_INFO,
+            setLayoutCount = 1,
+            pSetLayouts = &self.single_image_descriptor_layout,
+            pushConstantRangeCount = 1,
+            pPushConstantRanges = &vk.PushConstantRange {
+                stageFlags = {.VERTEX},
+                offset = 0,
+                size = size_of(vk.DeviceAddress),
+            },
+        }
+        if !vk_check(
+            vk.CreatePipelineLayout(
+                self.device,
+                &pipeline_layout_create_info,
+                nil,
+                &self.ui_pipeline_layout,
+            ),
+        ) {
+            log.error("Failed to create UI pipeline layout")
+            return false
+        }
+        deletion_queue_push(&self.deletion_queue, self.ui_pipeline_layout)
+
+        // Load the shader modules
+        vertex_shader_mod, fragment_shader_mod: vk.ShaderModule
+        vertex_shader_mod, ok = load_shader_module(self.device, "bin/shaders/ui.vert.spv")
+        if !ok { log.error("Failed to load UI vertex shader module"); return false }
+        defer vk.DestroyShaderModule(self.device, vertex_shader_mod, nil)
+        fragment_shader_mod, ok = load_shader_module(self.device, "bin/shaders/ui.frag.spv")
+        if !ok { log.error("Failed to load UI fragment shader module"); return false }
+        defer vk.DestroyShaderModule(self.device, fragment_shader_mod, nil)
+
+        // Create the UI pipeline
+        pipeline_builder_set_shaders(
+            &pipeline_builder,
+            {
+                {stage = .VERTEX, module = vertex_shader_mod},
+                {stage = .FRAGMENT, module = fragment_shader_mod},
+            },
+        )
+        pipeline_builder.pipeline_layout = self.ui_pipeline_layout
+
+        self.ui_pipeline, ok = pipeline_builder_build(&pipeline_builder, self.device)
+        if !ok { log.error("Failed to create UI graphics pipeline"); return false }
+        deletion_queue_push(&self.deletion_queue, self.ui_pipeline)
+    }
+
     return true
 }
 
@@ -1599,7 +1683,7 @@ _init_default_data :: proc(self: ^Engine) -> (ok: bool) {
 
     self.white_image = engine_create_image_with_data(
         self,
-        &white,
+        mem.ptr_to_bytes(&white),
         vk.Extent3D{1, 1, 1},
         .R8G8B8A8_UNORM,
         { .SAMPLED },
@@ -1608,7 +1692,7 @@ _init_default_data :: proc(self: ^Engine) -> (ok: bool) {
 
     self.grey_image = engine_create_image_with_data(
         self,
-        &grey,
+        mem.ptr_to_bytes(&grey),
         vk.Extent3D{1, 1, 1},
         .R8G8B8A8_UNORM,
         { .SAMPLED },
@@ -1617,7 +1701,7 @@ _init_default_data :: proc(self: ^Engine) -> (ok: bool) {
 
     self.black_image = engine_create_image_with_data(
         self,
-        &grey,
+        mem.ptr_to_bytes(&black),
         vk.Extent3D{1, 1, 1},
         .R8G8B8A8_UNORM,
         { .SAMPLED },
@@ -1633,7 +1717,7 @@ _init_default_data :: proc(self: ^Engine) -> (ok: bool) {
 
     self.error_checkerboard_image = engine_create_image_with_data(
         self,
-        &magenta_data[0],
+        mem.slice_to_bytes(magenta_data[:]),
         vk.Extent3D{16, 16, 1},
         .R8G8B8A8_UNORM,
         { .SAMPLED },
@@ -1652,6 +1736,43 @@ _init_default_data :: proc(self: ^Engine) -> (ok: bool) {
     sampler_create_info.magFilter = .LINEAR
     vk.CreateSampler(self.device, &sampler_create_info, nil, &self.default_sampler_linear)
     deletion_queue_push(&self.deletion_queue, self.default_sampler_linear)
+
+    UI_VERTEX_COUNT :: 1024 * 4
+    UI_INDEX_COUNT  :: 1024 * 6
+
+    // Create the UI vertex and index buffers
+    {
+        self.ui_vertex_buffer, ok = create_buffer(
+            self,
+            u64(UI_VERTEX_COUNT * size_of(Ui_Vertex)),
+            { .VERTEX_BUFFER, .SHADER_DEVICE_ADDRESS },
+            .CPU_TO_GPU,
+        )
+        if !ok {
+            log.error("Failed to create UI vertex buffer")
+            return false
+        }
+        deletion_queue_push(&self.deletion_queue, self.ui_vertex_buffer)
+        self.ui_vertex_buffer_address = vk.GetBufferDeviceAddress(
+            self.device,
+            &vk.BufferDeviceAddressInfo {
+                sType  = .BUFFER_DEVICE_ADDRESS_INFO,
+                buffer = self.ui_vertex_buffer.buffer,
+            },
+        )
+
+        self.ui_index_buffer, ok = create_buffer(
+            self,
+            u64(UI_INDEX_COUNT * size_of(u32)),
+            { .INDEX_BUFFER, .SHADER_DEVICE_ADDRESS },
+            .CPU_TO_GPU,
+        )
+        if !ok {
+            log.error("Failed to create UI index buffer")
+            return false
+        }
+        deletion_queue_push(&self.deletion_queue, self.ui_index_buffer)
+    }
 
     return true
 }
@@ -1672,8 +1793,7 @@ _load_meshes :: proc(self: ^Engine) -> (ok: bool) {
     return true
 }
 
-@(private = "file")
-_get_current_frame :: proc(self: ^Engine) -> (frame: ^Frame_Data) {
+engine_get_current_frame :: proc(self: ^Engine) -> (frame: ^Frame_Data) {
     frame_index := u32(self.frame_number % INFLIGHT_FRAME_OVERLAP)
     return &self.frames[frame_index]
 }

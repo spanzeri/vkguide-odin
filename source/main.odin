@@ -6,22 +6,25 @@ import "core:mem"
 
 start :: proc() -> (ok: bool) {
     engine := Engine{}
-
-    // !!Test code: BEGIN!!
-    ui_context: Ui_Context
-    ui_context, ok = ui_init(Ui_Config{})
-    if !ok {
-        log.errorf("Failed to initialize UI context")
-        return false
-    }
-    defer ui_shutdown(&ui_context)
-    // !!Test code: END!!
-
     if !engine_init(&engine) {
         return false
     }
     defer engine_shutdown(&engine)
-    engine_run(&engine)
+
+    // !!Test code: BEGIN!!
+    ui_context :Ui_Context
+    ui_context, ok = ui_init(Ui_Config{
+        font_path = "assets/NotoSans-Regular.ttf",
+        font_size = 16,
+    }, &engine)
+    if !ok {
+        log.errorf("Failed to initialize UI context")
+        return false
+    }
+    defer ui_shutdown(ui_context, &engine)
+    // !!Test code: END!!
+
+    engine_run(&engine, ui_context)
 
     return true
 }
